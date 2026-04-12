@@ -1,0 +1,6 @@
+name=00_ModProfiler
+poster=poster.png
+id=00_ModProfiler
+description=Universal mod callback profiler. Wraps all mod event registrations with timing. 00_ prefix ensures alphabetical sort places it first. Disable when not profiling.
+modversion=1.0
+versionMin=42.0
