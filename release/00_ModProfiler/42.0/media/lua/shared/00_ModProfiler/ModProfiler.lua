@@ -65,6 +65,14 @@ local function ringToArray(ring)
     return out
 end
 
+-- O(1) indexed access into a ring without copying to a new array.
+-- i = 1 is the oldest entry, i = ring.count is the newest.
+local function ringGet(ring, i)
+    if i < 1 or i > ring.count then return nil end
+    if ring.count < ring.size then return ring.data[i] end
+    return ring.data[((ring.head + i - 1) % ring.size) + 1]
+end
+
 ---------------------------------------------------------------------------
 -- Internal state
 ---------------------------------------------------------------------------
@@ -103,6 +111,10 @@ local _frameBudgetRing  = ringCreate(FRAME_BUDGET_RING_SIZE)
 local _cpuMsSum    = 0
 local _cpuMsCount  = 0
 local _cpuMsPeak   = 0
+
+-- Dirty flag: set after each interval report so the UI refreshes exactly
+-- at interval boundaries — not on a separate timer.
+local _snapshotDirty = false
 
 -- Self-stats: profiler wrapper overhead
 local _selfStats = {
@@ -430,6 +442,7 @@ local function dumpIntervalReport(shouldPrint)
         headroomMs = headroomMs, budgetMs = budgetMs,
         fps = targetFps, uncapped = uncapped,
     })
+    _snapshotDirty = true
 
     -- Console output (print cadence only)
     if shouldPrint then
@@ -614,14 +627,29 @@ function ModProfiler.resetSession()
     _modSessionTotals, _modMinuteAccum, _modPeriodAccum = {}, {}, {}
     _frameBudgetRing = ringCreate(FRAME_BUDGET_RING_SIZE)
     _cpuMsSum, _cpuMsCount, _cpuMsPeak = 0, 0, 0
+    _snapshotDirty = true
     _sessionStartMs = getTimestampMs()
     _lastMinuteRollMs, _lastPeriodRollMs = _sessionStartMs, _sessionStartMs
     for _, cb in pairs(_callbacks) do cb.iCalls, cb.iMs, cb.iPeak = 0, 0, 0 end
     print("[MODPROFILER] session reset")
 end
 
--- Expose ring helper so UI can reuse it without redefining
+-- Expose ring helpers so UI can reuse them without redefining.
 ModProfiler.ringToArray = ringToArray
+ModProfiler.ringGet     = ringGet
+
+-- Dirty flag: the UI checks this to refresh only at interval boundaries.
+function ModProfiler.isSnapshotDirty()    return _snapshotDirty end
+function ModProfiler.clearSnapshotDirty() _snapshotDirty = false end
+
+-- Zero-copy ring access: returns raw ring objects for ringGet iteration.
+-- Avoids the per-call table allocation that ringToArray requires.
+function ModProfiler.getModLiveRing(modName)   return _modLiveRings[modName] end
+function ModProfiler.getModMinuteRing(modName)  return _modMinuteRings[modName] end
+function ModProfiler.getModPeriodRing(modName)  return _modPeriodRings[modName] end
+function ModProfiler.getFrameBudgetRing()       return _frameBudgetRing end
+function ModProfiler.getSelfDumpRing()          return _selfStats.dumpMsRing end
+function ModProfiler.getSelfWrapperMs()         return _selfStats.wrapperCalibratedMs end
 
 print(string.format(
     "[MODPROFILER] Installed: %d/%d events intercepted, interval=%d ticks, print=%d ticks, summary=%d ticks",

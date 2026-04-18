@@ -116,11 +116,11 @@ local function trendGlyph(pctPerUnit, thresholdRising, thresholdFalling, minSamp
     return ">", TREND_NEUTRAL
 end
 
-local function shortTrend(liveRing, intervalSec)
-    local n = #liveRing
+-- ys: pre-filled plain-number array of msPerFrame values (time-ordered).
+-- Caller fills a reusable scratch buffer; zero allocation in this function.
+local function shortTrend(ys, intervalSec)
+    local n = #ys
     if n < 10 then return "-", TREND_NEUTRAL, 0 end
-    local ys = {}
-    for i = 1, n do ys[i] = liveRing[i].msPerFrame or 0 end
     local slopePerSample, mean = olsSlope(ys)
     if not slopePerSample or mean <= 0 then return ">", TREND_NEUTRAL, 0 end
     local slopePerMin = slopePerSample * (60 / intervalSec)
@@ -129,14 +129,11 @@ local function shortTrend(liveRing, intervalSec)
     return g, c, pctPerMin
 end
 
-local function longTrend(minuteRing, periodRing, sessionMin)
-    local src, sampleMin
-    if sessionMin < 30 then src, sampleMin = minuteRing, 1
-    else src, sampleMin = periodRing, 5 end
-    local n = #src
+-- ys: pre-filled plain-number array from the appropriate tier ring.
+-- sampleMin: 1 for minute ring, 5 for period ring.
+local function longTrend(ys, sampleMin, sessionMin)
+    local n = #ys
     if sessionMin < 3 or n < 3 then return "-", TREND_NEUTRAL, 0 end
-    local ys = {}
-    for i = 1, n do ys[i] = src[i].msPerFrame or 0 end
     local slopePerSample, mean = olsSlope(ys)
     if not slopePerSample or mean <= 0 then return ">", TREND_NEUTRAL, 0 end
     local slopePerHour = slopePerSample * (60 / sampleMin)
@@ -145,11 +142,13 @@ local function longTrend(minuteRing, periodRing, sessionMin)
     return g, c, pctPerHour
 end
 
-local function spikesPerMin(liveRing, intervalSec)
-    local n = #liveRing
+-- Iterates ring in-place via ringGet — no array copy needed.
+local function spikesPerMinFromRing(ring, intervalSec)
+    local n = ring and ring.count or 0
     if n < 10 then return nil end
+    local rg = ModProfiler.ringGet
     local sum = 0
-    for i = 1, n do sum = sum + (liveRing[i].spikes or 0) end
+    for i = 1, n do sum = sum + ((rg(ring, i)).spikes or 0) end
     local windowMin = (n * intervalSec) / 60
     if windowMin <= 0 then return 0 end
     return sum / windowMin
@@ -323,20 +322,20 @@ local function drawStackedArea(panel, x, y, w, h, layers, budgetMs, font)
     end
 end
 
-local function drawBudget(panel, x, y, w, h, font, samples)
-    local n = #samples
+local function drawBudget(panel, x, y, w, h, font)
+    local n = panel._budgetN
     if n < 2 then
         panel:drawText("Frame budget: collecting data...", x, y, TEXT_DIM.r, TEXT_DIM.g, TEXT_DIM.b, 1, font)
         return y + 16
     end
 
-    local last = samples[n]
-    local uncappedLast = last.uncapped == true
-    local title = uncappedLast and "FRAME BUDGET (UNCAPPED)" or "FRAME BUDGET"
+    local last = panel._budgetLast
+    local uncapped = panel._budgetUncapped
+    local title = uncapped and "FRAME BUDGET (UNCAPPED)" or "FRAME BUDGET"
     panel:drawText(title, x, y, TEXT_HEADER.r, TEXT_HEADER.g, TEXT_HEADER.b, 1, font)
 
     local overBy = last.cpuMs - last.budgetMs
-    if overBy > 0 and not uncappedLast then
+    if overBy > 0 and not uncapped then
         local blink = (getTimestampMs() % 1000) < 500
         if blink then
             panel:drawText(string.format("! OVER BUDGET: +%.1fms", overBy),
@@ -344,34 +343,17 @@ local function drawBudget(panel, x, y, w, h, font, samples)
         end
     end
 
-    -- Generous padding so the title never gets painted over by the
-    -- topmost stacked bar (e.g. mod band on a heavy interval).
     local titlePad = 22
     local gy = y + titlePad
     local footerPad = 14
     local gh = h - titlePad - footerPad
 
-    local headroom, engine, mods = {}, {}, {}
-    for i = 1, n do
-        headroom[i] = uncappedLast and 0 or (samples[i].headroomMs or 0)
-        engine[i]   = samples[i].engineMs or 0
-        mods[i]     = samples[i].modMs    or 0
-    end
+    -- Use pre-filled layer arrays from refreshBudgetLayers (zero alloc here).
+    local layerList = uncapped and panel._layerListUncapped or panel._layerListCapped
 
-    -- Three distinct LIGHTNESS tones (not alpha variants of one color).
-    -- Bottom-up draw order: headroom -> engine -> mods so the stack reads
-    -- as "dark floor = unused time, mid = engine, bright crown = mods."
-    local layerList = {
-        { name="Headroom",             values=headroom, r=BG_HEADROOM.r, g=BG_HEADROOM.g, b=BG_HEADROOM.b, a=BG_HEADROOM.a },
-        { name="Engine + unattributed",values=engine,   r=BG_ENGINE.r,   g=BG_ENGINE.g,   b=BG_ENGINE.b,   a=BG_ENGINE.a },
-        { name="Mods",                 values=mods,     r=BG_MODS.r,     g=BG_MODS.g,     b=BG_MODS.b,     a=BG_MODS.a },
-    }
-    if uncappedLast then table.remove(layerList, 1) end
+    drawStackedArea(panel, x, gy, w, gh, layerList, uncapped and nil or last.budgetMs, font)
 
-    drawStackedArea(panel, x, gy, w, gh, layerList, uncappedLast and nil or last.budgetMs, font)
-
-    -- Legend row (single line, muted). Budget-line swatch included so the
-    -- amber dashed line is self-explanatory.
+    -- Legend row
     local legendY = gy + gh + 2
     local lx = x
     for _, L in ipairs(layerList) do
@@ -379,33 +361,16 @@ local function drawBudget(panel, x, y, w, h, font, samples)
         panel:drawText(L.name, lx + 12, legendY, TEXT_DIM.r, TEXT_DIM.g, TEXT_DIM.b, 1, font)
         lx = lx + 14 + getTextManager():MeasureStringX(font, L.name) + 12
     end
-    if not uncappedLast then
+    if not uncapped then
         panel:drawRect(lx, legendY + 5, 8, 1, BUDGET_LINE.r, BUDGET_LINE.g, BUDGET_LINE.b, BUDGET_LINE.a)
         panel:drawText("budget", lx + 12, legendY, TEXT_DIM.r, TEXT_DIM.g, TEXT_DIM.b, 1, font)
     end
 
-    -- Footer stats
-    local sumHr, minHr, maxHr = 0, math.huge, -math.huge
-    local budgetAvg = 0
-    for i = 1, n do
-        local hr = samples[i].headroomMs or 0
-        sumHr = sumHr + hr
-        if hr < minHr then minHr = hr end
-        if hr > maxHr then maxHr = hr end
-        budgetAvg = budgetAvg + (samples[i].budgetMs or 16.67)
-    end
-    local avgHr = sumHr / n
-    budgetAvg = budgetAvg / n
-    local freePct = budgetAvg > 0 and (avgHr / budgetAvg * 100) or 0
+    -- Footer uses pre-computed stats from refreshBudgetLayers.
     local footer = string.format("Avg headroom: %.1f ms (%d%% free)   min: %.1f   max: %.1f",
-                                 avgHr, freePct+0.5, minHr, maxHr)
+                                 panel._footerAvgHr, panel._footerFreePct+0.5, panel._footerMinHr, panel._footerMaxHr)
     panel:drawText(footer, x, y + h + 2, TEXT_DIM.r, TEXT_DIM.g, TEXT_DIM.b, 1, font)
 
-    -- Coverage-boundary note: the profiler only wraps Lua event callbacks
-    -- registered via Events.X.Add. Native engine work (rendering, asset
-    -- decoding, physics, script-parsing for .txt files in other mods)
-    -- shows up in the total cpuMs but gets attributed to the Engine band
-    -- because there's no Lua hook to intercept it.
     local note = "Mods band = profiled Lua callbacks only; native/asset cost rolls into Engine band."
     panel:drawText(note, x, y + h + 14, TEXT_DIM.r, TEXT_DIM.g, TEXT_DIM.b, 0.75, font)
 
@@ -443,14 +408,34 @@ function ModProfilerPanel:new(x, y, w, h)
     o.intervalTicks   = ModProfilerINI.num(ini, "intervalTicks", 120)
     o._ini            = ini
     o._comboW         = 90
-    -- Cached data: rebuilt at interval boundaries, not every frame.
-    -- This prevents ~9000 table allocations/sec from GC-choking Kahlua.
-    o._lastRefreshMs       = 0
-    o._cachedBudgetSamples = {}
+    -- Pre-allocated buffers for zero-alloc refresh path.
+    -- All data rebuilt at interval boundaries via engine dirty flag.
     o._cachedSelfRow       = nil
     o._cachedHeaderCpuMs   = 0
     o._cachedHeaderBudgetMs= 1000/60
     o._cachedHeaderPct     = 0
+    o._scratch             = {}   -- reusable number array for percentile/OLS
+    o._layerHeadroom       = {}   -- pre-allocated graph band value arrays
+    o._layerEngine         = {}
+    o._layerMods           = {}
+    o._budgetN             = 0    -- valid entry count in layer arrays
+    o._budgetLast          = nil  -- newest budget ring entry (reference)
+    o._budgetUncapped      = false
+    o._footerAvgHr         = 0
+    o._footerMinHr         = 0
+    o._footerMaxHr         = 0
+    o._footerFreePct       = 0
+    -- Static layer descriptors — point to the pre-allocated value arrays.
+    -- drawBudget picks the right list each frame with zero allocation.
+    o._layerListCapped = {
+        { name="Headroom",              values=o._layerHeadroom, r=BG_HEADROOM.r, g=BG_HEADROOM.g, b=BG_HEADROOM.b, a=BG_HEADROOM.a },
+        { name="Engine + unattributed", values=o._layerEngine,   r=BG_ENGINE.r,   g=BG_ENGINE.g,   b=BG_ENGINE.b,   a=BG_ENGINE.a },
+        { name="Mods",                  values=o._layerMods,     r=BG_MODS.r,     g=BG_MODS.g,     b=BG_MODS.b,     a=BG_MODS.a },
+    }
+    o._layerListUncapped = {
+        o._layerListCapped[2],   -- Engine
+        o._layerListCapped[3],   -- Mods
+    }
     return o
 end
 
@@ -517,48 +502,71 @@ function ModProfilerPanel:refreshRows()
     local intervalSec = (ModProfiler.getIntervalSeconds and ModProfiler.getIntervalSeconds()) or 2
     local sessionMin  = (ModProfiler.getSessionElapsedMinutes and ModProfiler.getSessionElapsedMinutes()) or 0
     local names = (ModProfiler.getAllModNames and ModProfiler.getAllModNames()) or {}
+    local rg = ModProfiler.ringGet
+    local scratch = self._scratch
     local rows = {}
     local sumLiveMs = 0
 
-    -- The profiler reports its own cost in a dedicated self-cost row below
-    -- the main table. Exclude it here so it doesn't double-report.
-    local perModLive = {}
+    -- Pass 1: total live-ms across all non-self mods (ring-direct, no copies).
     for _, m in ipairs(names) do
         if m ~= SELF_MOD_NAME then
-            local live = ModProfiler.getModLiveSamples(m) or {}
-            perModLive[m] = live
-            local s = 0
-            for i = 1, #live do s = s + (live[i].msPerFrame or 0) end
-            sumLiveMs = sumLiveMs + s
+            local ring = ModProfiler.getModLiveRing(m)
+            if ring and ring.count > 0 then
+                for i = 1, ring.count do
+                    sumLiveMs = sumLiveMs + ((rg(ring, i)).msPerFrame or 0)
+                end
+            end
         end
     end
 
+    -- Pass 2: per-mod stats. One reusable scratch buffer for OLS + percentile.
     for _, m in ipairs(names) do
-        local live = perModLive[m]
-        if live and #live > 0 then
-            local ys = {}
-            for i = 1, #live do ys[i] = live[i].msPerFrame end
-            table.sort(ys)
-            local p50 = percentile(ys, 50)
-            local p95 = percentile(ys, 95)
-            local modTotal = 0
-            for i = 1, #ys do modTotal = modTotal + ys[i] end
-            local pctTotal = sumLiveMs > 0 and (modTotal / sumLiveMs * 100) or 0
+        if m ~= SELF_MOD_NAME then
+            local ring = ModProfiler.getModLiveRing(m)
+            if ring and ring.count > 0 then
+                local n = ring.count
+                -- Fill scratch with msPerFrame (time-ordered for OLS).
+                local modTotal = 0
+                for i = 1, n do
+                    local v = (rg(ring, i)).msPerFrame or 0
+                    scratch[i] = v
+                    modTotal = modTotal + v
+                end
+                for i = n + 1, #scratch do scratch[i] = nil end
 
-            local shortG, shortC = shortTrend(live, intervalSec)
-            local longG,  longC  = longTrend(
-                ModProfiler.getModMinuteSamples(m) or {},
-                ModProfiler.getModPeriodSamples(m) or {},
-                sessionMin)
-            local spk = spikesPerMin(live, intervalSec)
+                -- Short trend (needs unsorted time-ordered data).
+                local shortG, shortC = shortTrend(scratch, intervalSec)
+                -- Sort in-place for percentile (scratch order consumed).
+                table.sort(scratch)
+                local p50 = percentile(scratch, 50)
+                local p95 = percentile(scratch, 95)
+                local pctTotal = sumLiveMs > 0 and (modTotal / sumLiveMs * 100) or 0
 
-            rows[#rows+1] = {
-                mod = m, pctTotal = pctTotal, p50 = p50, p95 = p95,
-                spikesPerMin = spk,
-                shortG = shortG, shortC = shortC,
-                longG = longG, longC = longC,
-                pinned = self.pinned[m] == true,
-            }
+                -- Spikes: iterate ring directly (no scratch needed).
+                local spk = spikesPerMinFromRing(ring, intervalSec)
+
+                -- Long trend: refill scratch from minute or period ring.
+                local longRing, sampleMin
+                if sessionMin < 30 then
+                    longRing = ModProfiler.getModMinuteRing(m)
+                    sampleMin = 1
+                else
+                    longRing = ModProfiler.getModPeriodRing(m)
+                    sampleMin = 5
+                end
+                local ln = longRing and longRing.count or 0
+                for i = 1, ln do scratch[i] = (rg(longRing, i)).msPerFrame or 0 end
+                for i = ln + 1, #scratch do scratch[i] = nil end
+                local longG, longC = longTrend(scratch, sampleMin, sessionMin)
+
+                rows[#rows+1] = {
+                    mod = m, pctTotal = pctTotal, p50 = p50, p95 = p95,
+                    spikesPerMin = spk,
+                    shortG = shortG, shortC = shortC,
+                    longG = longG, longC = longC,
+                    pinned = self.pinned[m] == true,
+                }
+            end
         end
     end
 
@@ -581,17 +589,51 @@ function ModProfilerPanel:refreshRows()
     self.rows = displayed
 end
 
+function ModProfilerPanel:refreshBudgetLayers()
+    local ring = ModProfiler.getFrameBudgetRing and ModProfiler.getFrameBudgetRing()
+    local rg = ModProfiler.ringGet
+    local n = ring and ring.count or 0
+    self._budgetN = n
+    if n < 1 then self._budgetLast = nil; return end
+
+    self._budgetLast = rg(ring, n)
+    local uncapped = self._budgetLast.uncapped == true
+    self._budgetUncapped = uncapped
+    local headroom = self._layerHeadroom
+    local engine   = self._layerEngine
+    local mods     = self._layerMods
+    local sumHr, minHr, maxHr, budgetSum = 0, math.huge, -math.huge, 0
+    for i = 1, n do
+        local s = rg(ring, i)
+        local hr = s.headroomMs or 0
+        headroom[i] = uncapped and 0 or hr
+        engine[i]   = s.engineMs or 0
+        mods[i]     = s.modMs or 0
+        sumHr = sumHr + hr
+        if hr < minHr then minHr = hr end
+        if hr > maxHr then maxHr = hr end
+        budgetSum = budgetSum + (s.budgetMs or 16.67)
+    end
+    -- Nil extras from previous (possibly larger) dataset.
+    for i = n + 1, #headroom do headroom[i] = nil end
+    for i = n + 1, #engine   do engine[i]   = nil end
+    for i = n + 1, #mods     do mods[i]     = nil end
+    self._footerAvgHr  = n > 0 and (sumHr / n) or 0
+    self._footerMinHr  = n > 0 and minHr or 0
+    self._footerMaxHr  = n > 0 and maxHr or 0
+    local budgetAvg = n > 0 and (budgetSum / n) or 16.67
+    self._footerFreePct = budgetAvg > 0 and (self._footerAvgHr / budgetAvg * 100) or 0
+end
+
 function ModProfilerPanel:buildSelfCostRow()
-    if not ModProfiler.getSelfStats then return nil end
-    local sstats = ModProfiler.getSelfStats()
-    if not sstats then return nil end
+    local dumpRing = ModProfiler.getSelfDumpRing and ModProfiler.getSelfDumpRing()
+    if not dumpRing or dumpRing.count < 2 then return nil end
+    local wrapMean = (ModProfiler.getSelfWrapperMs and ModProfiler.getSelfWrapperMs()) or 0
     local intervalSec = (ModProfiler.getIntervalSeconds and ModProfiler.getIntervalSeconds()) or 2
     local intervalTicks = intervalSec * 60
     if intervalTicks <= 0 then return nil end
 
-    local dumpArr = sstats.intervalDumpMs or {}
-    local wrapMean = sstats.wrapperPerCallMs or 0
-
+    local rg = ModProfiler.ringGet
     local callsPerInterval = 0
     local modStats = ModProfiler.getModStats and ModProfiler.getModStats() or {}
     local totMin = (ModProfiler.getSessionElapsedMinutes and ModProfiler.getSessionElapsedMinutes()) or 0
@@ -602,16 +644,16 @@ function ModProfilerPanel:buildSelfCostRow()
         if totalIntervals > 0 then callsPerInterval = totalCalls / totalIntervals end
     end
 
-    local samples = {}
-    for i = 1, #dumpArr do
-        local d = dumpArr[i] or 0
-        local perInterval = wrapMean * callsPerInterval + d
-        samples[i] = perInterval / intervalTicks
+    local scratch = self._scratch
+    local n = dumpRing.count
+    for i = 1, n do
+        local d = rg(dumpRing, i) or 0
+        scratch[i] = (wrapMean * callsPerInterval + d) / intervalTicks
     end
-    if #samples < 2 then return nil end
-    local sorted = {}; for i = 1, #samples do sorted[i] = samples[i] end; table.sort(sorted)
-    local p50 = percentile(sorted, 50)
-    local p95 = percentile(sorted, 95)
+    for i = n + 1, #scratch do scratch[i] = nil end
+    table.sort(scratch)
+    local p50 = percentile(scratch, 50)
+    local p95 = percentile(scratch, 95)
 
     return {
         mod = "00_ModProfiler",
@@ -673,21 +715,17 @@ function ModProfilerPanel:prerender()
     -- the interval-progress bar doesn't visually cut through the title.
     local y = self:titleBarHeight() + 14
 
-    -- CRITICAL PERF: Only rebuild rows / budget / self-cost when new
-    -- interval data is available. Between refreshes the cached tables
-    -- are reused for drawing — zero per-frame allocations.
-    -- Refresh at most every 500ms so even long intervals stay responsive.
-    local now = getTimestampMs()
-    if (now - self._lastRefreshMs) >= 500 then
-        self._lastRefreshMs = now
+    -- Refresh only when the engine produces new interval data (dirty flag).
+    -- This aligns the UI rebuild exactly with the user-selected polling
+    -- rate — no wasted work, no data misalignment.
+    if ModProfiler.isSnapshotDirty and ModProfiler.isSnapshotDirty() then
+        ModProfiler.clearSnapshotDirty()
         self:refreshRows()
-        self._cachedBudgetSamples = (ModProfiler.getFrameBudgetSamples and ModProfiler.getFrameBudgetSamples()) or {}
+        self:refreshBudgetLayers()
         self._cachedSelfRow = self:buildSelfCostRow()
-        local bs = self._cachedBudgetSamples
-        if #bs > 0 then
-            local last = bs[#bs]
-            self._cachedHeaderCpuMs    = last.cpuMs or 0
-            self._cachedHeaderBudgetMs = last.budgetMs or (1000/60)
+        if self._budgetLast then
+            self._cachedHeaderCpuMs    = self._budgetLast.cpuMs or 0
+            self._cachedHeaderBudgetMs = self._budgetLast.budgetMs or (1000/60)
         end
         self._cachedHeaderPct = self._cachedHeaderBudgetMs > 0
             and (self._cachedHeaderCpuMs / self._cachedHeaderBudgetMs * 100) or 0
@@ -719,7 +757,7 @@ function ModProfilerPanel:prerender()
     local available = self:getHeight() - y - 12
     local gh = math.max(80, math.min(180, math.floor(available)))
     if gh > 40 then
-        y = drawBudget(self, gx, y + 6, gw, gh, font, self._cachedBudgetSamples)
+        y = drawBudget(self, gx, y + 6, gw, gh, font)
     end
 end
 

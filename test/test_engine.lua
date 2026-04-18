@@ -192,5 +192,48 @@ Events.OnTick.Remove(dummy1)
 ok("Remove does not error", true)
 
 ---------------------------------------------------------------------------
+section("Scenario H: ringGet + dirty flag + raw ring API")
+---------------------------------------------------------------------------
+env.setMs(0)
+env.setPerformance(env.defaultPerfFull())
+env.setCPU(6.0)
+MP = loadEngine()
+ok("ringGet exposed", type(MP.ringGet) == "function")
+ok("isSnapshotDirty exposed", type(MP.isSnapshotDirty) == "function")
+ok("clearSnapshotDirty exposed", type(MP.clearSnapshotDirty) == "function")
+ok("getFrameBudgetRing exposed", type(MP.getFrameBudgetRing) == "function")
+
+-- Initially clean.
+ok("snapshot not dirty before ticks", MP.isSnapshotDirty() == false)
+
+-- Run one full interval (120 ticks) so dumpIntervalReport fires.
+env.setMs(100)
+for i = 1, 120 do env.trigger("OnTick") end
+ok("snapshot dirty after interval", MP.isSnapshotDirty() == true)
+MP.clearSnapshotDirty()
+ok("snapshot clean after clear", MP.isSnapshotDirty() == false)
+
+-- ringGet should return the same values as ringToArray.
+local budgetArr = MP.getFrameBudgetSamples()
+local budgetRing = MP.getFrameBudgetRing()
+ok("budget ring not nil", budgetRing ~= nil)
+ok("budget ring count matches array", budgetRing.count == #budgetArr)
+local ringGetMatch = true
+for i = 1, budgetRing.count do
+    local fromArr  = budgetArr[i]
+    local fromRing = MP.ringGet(budgetRing, i)
+    if fromArr ~= fromRing then ringGetMatch = false; break end
+end
+ok("ringGet matches ringToArray element-by-element", ringGetMatch)
+
+-- Out-of-bounds ringGet returns nil.
+ok("ringGet(ring, 0) == nil", MP.ringGet(budgetRing, 0) == nil)
+ok("ringGet(ring, count+1) == nil", MP.ringGet(budgetRing, budgetRing.count + 1) == nil)
+
+-- Raw mod ring access.
+local modLiveRing = MP.getModLiveRing("TestMod")
+ok("getModLiveRing returns ring", modLiveRing ~= nil and modLiveRing.count and modLiveRing.count > 0)
+
+---------------------------------------------------------------------------
 print(string.format("\n== %d passed, %d failed ==", passed, failed))
 os.exit(failed == 0 and 0 or 1)
