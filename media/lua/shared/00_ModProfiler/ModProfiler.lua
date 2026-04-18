@@ -112,6 +112,16 @@ local _cpuMsSum    = 0
 local _cpuMsCount  = 0
 local _cpuMsPeak   = 0
 
+-- Per-tick CPU/GPU wait sampling (render-sync overhead)
+local _cpuWaitSum   = 0
+local _cpuWaitCount = 0
+local _gpuWaitSum   = 0
+local _gpuWaitCount = 0
+
+-- Per-interval heap tracking for GC pressure detection
+local _heapFreeAtIntervalStart = 0
+local _heapTotalAtIntervalStart = 0
+
 -- Dirty flag: set after each interval report so the UI refreshes exactly
 -- at interval boundaries — not on a separate timer.
 local _snapshotDirty = false
@@ -222,6 +232,34 @@ local function probeCpuMs()
     local ok, cpu = pcall(getCPUTime)
     if ok and type(cpu) == "number" and cpu >= 0 then return cpu end
     return nil
+end
+
+local function probeCpuWaitMs()
+    if type(getCPUWait) ~= "function" then return nil end
+    local ok, v = pcall(getCPUWait)
+    if ok and type(v) == "number" and v >= 0 then return v end
+    return nil
+end
+
+local function probeGpuWaitMs()
+    if type(getGPUWait) ~= "function" then return nil end
+    local ok, v = pcall(getGPUWait)
+    if ok and type(v) == "number" and v >= 0 then return v end
+    return nil
+end
+
+local function probeHeapMb()
+    if type(getPerformanceLocal) ~= "function" then return nil, nil end
+    local ok, t = pcall(getPerformanceLocal)
+    if not ok or type(t) ~= "table" then return nil, nil end
+    -- getPerformanceLocal() returns a table; memory keys vary by PZ build.
+    -- Try common key names for free/total memory (in bytes).
+    local free  = t.freeMemory  or t.freemem  or t["freeMemory"]
+    local total = t.totalMemory or t.totalmem or t["totalMemory"]
+    if type(free) == "number" and type(total) == "number" then
+        return free / (1024*1024), total / (1024*1024)  -- convert to MB
+    end
+    return nil, nil
 end
 
 local function calibrateWrapperOverhead()
@@ -434,6 +472,21 @@ local function dumpIntervalReport(shouldPrint)
     if not cpuMs then cpuMs = grandMs / INTERVAL_TICKS end
     -- Reset per-tick CPU accumulator for the next interval window.
     _cpuMsSum, _cpuMsCount, _cpuMsPeak = 0, 0, 0
+
+    -- Average CPU/GPU wait for this interval.
+    local cpuWaitMs = _cpuWaitCount > 0 and (_cpuWaitSum / _cpuWaitCount) or 0
+    local gpuWaitMs = _gpuWaitCount > 0 and (_gpuWaitSum / _gpuWaitCount) or 0
+    _cpuWaitSum, _cpuWaitCount = 0, 0
+    _gpuWaitSum, _gpuWaitCount = 0, 0
+
+    -- Heap snapshot: capture free/total now and compute delta since last interval.
+    local heapFreeMb, heapTotalMb = probeHeapMb()
+    local heapAllocMb = 0  -- positive = net allocation since last interval
+    if heapFreeMb and _heapFreeAtIntervalStart > 0 then
+        heapAllocMb = _heapFreeAtIntervalStart - heapFreeMb  -- free went down = alloc
+    end
+    _heapFreeAtIntervalStart  = heapFreeMb or 0
+    _heapTotalAtIntervalStart = heapTotalMb or 0
     local modMs      = grandMs / INTERVAL_TICKS
     local engineMs   = math.max(0, cpuMs - modMs)
     local headroomMs = math.max(0, budgetMs - cpuMs)
@@ -441,6 +494,9 @@ local function dumpIntervalReport(shouldPrint)
         cpuMs = cpuMs, modMs = modMs, engineMs = engineMs,
         headroomMs = headroomMs, budgetMs = budgetMs,
         fps = targetFps, uncapped = uncapped,
+        cpuWaitMs = cpuWaitMs, gpuWaitMs = gpuWaitMs,
+        heapFreeMb = heapFreeMb or 0, heapTotalMb = heapTotalMb or 0,
+        heapAllocMb = heapAllocMb,
     })
     _snapshotDirty = true
 
@@ -538,6 +594,12 @@ local function engineTick()
         _cpuMsCount = _cpuMsCount + 1
         if cpu > _cpuMsPeak then _cpuMsPeak = cpu end
     end
+
+    -- Sample CPU/GPU render-sync wait per tick.
+    local cw = probeCpuWaitMs()
+    if cw then _cpuWaitSum = _cpuWaitSum + cw; _cpuWaitCount = _cpuWaitCount + 1 end
+    local gw = probeGpuWaitMs()
+    if gw then _gpuWaitSum = _gpuWaitSum + gw; _gpuWaitCount = _gpuWaitCount + 1 end
 
     local nowMs = getTimestampMs()
     if nowMs - _selfStats.lastCalibratedAtMs >= _selfStats.calibrationIntervalMs then

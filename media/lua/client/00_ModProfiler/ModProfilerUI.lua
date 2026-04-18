@@ -424,6 +424,7 @@ function ModProfilerPanel:new(x, y, w, h)
     o._gapShortC           = TREND_NEUTRAL
     o._gapLongG            = "-"
     o._gapLongC            = TREND_NEUTRAL
+    o._fmtGapLine2         = ""    -- second gap line: render sync + heap
     -- Static layer descriptors — point to the pre-allocated value arrays.
     -- drawBudget picks the right list each frame with zero allocation.
     o._layerListCapped = {
@@ -642,6 +643,7 @@ function ModProfilerPanel:refreshGapStats()
     local n = ring and ring.count or 0
     if n < 2 then
         self._fmtGapLine = ""
+        self._fmtGapLine2 = ""
         self._gapShortG = "-"; self._gapShortC = TREND_NEUTRAL
         self._gapLongG  = "-"; self._gapLongC  = TREND_NEUTRAL
         return
@@ -670,11 +672,9 @@ function ModProfilerPanel:refreshGapStats()
     local shortG, shortC = shortTrend(scratch, intervalSec)
 
     -- Long trend: use the budget ring as-is (it's the only tier for gap).
-    -- For sessions > 30min we'd want a period ring, but budget ring is
-    -- our best available window for gap analysis.
     local longG, longC
     if sessionMin >= 3 and n >= 3 then
-        longG, longC = shortTrend(scratch, intervalSec)  -- reuse same window
+        longG, longC = shortTrend(scratch, intervalSec)
     else
         longG, longC = "-", TREND_NEUTRAL
     end
@@ -684,6 +684,30 @@ function ModProfilerPanel:refreshGapStats()
     self._fmtGapLine = string.format(
         "Unattributed: %.1f ms (avg %.1f ms, %d%% of CPU)   mods: %.1f ms   total: %.1f ms",
         lastGap, avgGap, gapPct + 0.5, lastMod, lastCpu)
+
+    -- Second line: render-sync + heap breakdown (if available)
+    local cpuW = last.cpuWaitMs or 0
+    local gpuW = last.gpuWaitMs or 0
+    local heapFree  = last.heapFreeMb or 0
+    local heapTotal = last.heapTotalMb or 0
+    local heapAlloc = last.heapAllocMb or 0
+    local heapUsed  = heapTotal > 0 and (heapTotal - heapFree) or 0
+    local heapPct   = heapTotal > 0 and (heapUsed / heapTotal * 100) or 0
+
+    if cpuW > 0 or gpuW > 0 or heapTotal > 0 then
+        local parts = {}
+        if cpuW > 0 or gpuW > 0 then
+            parts[#parts+1] = string.format("render sync: cpu-wait %.1f / gpu-wait %.1f ms", cpuW, gpuW)
+        end
+        if heapTotal > 0 then
+            local allocDir = heapAlloc > 0 and "+" or ""
+            parts[#parts+1] = string.format("heap: %dMB / %dMB (%d%%) %s%.0fMB/int",
+                heapUsed, heapTotal, heapPct + 0.5, allocDir, heapAlloc)
+        end
+        self._fmtGapLine2 = table.concat(parts, "   ")
+    else
+        self._fmtGapLine2 = ""
+    end
 end
 
 function ModProfilerPanel:buildSelfCostRow()
@@ -847,6 +871,11 @@ function ModProfilerPanel:prerender()
         local g1w = getTextManager():MeasureStringX(font, g1 .. " ")
         self:drawText(g2, trendX + g1w, y, self._gapLongC.r, self._gapLongC.g, self._gapLongC.b, 1, font)
         y = y + 16
+        -- Second line: render sync + heap breakdown
+        if #(self._fmtGapLine2 or "") > 0 then
+            self:drawText(self._fmtGapLine2, 10, y, TEXT_DIM.r, TEXT_DIM.g, TEXT_DIM.b, 1, font)
+            y = y + 16
+        end
     end
 
     local gx = 10
