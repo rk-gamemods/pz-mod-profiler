@@ -419,6 +419,11 @@ function ModProfilerPanel:new(x, y, w, h)
     o._fmtHeaderBig        = ""    -- cached formatted strings (rebuilt per refresh)
     o._fmtHeaderBigShort   = ""
     o._fmtBudgetFooter     = ""
+    o._fmtGapLine          = ""    -- unattributed gap summary
+    o._gapShortG           = "-"   -- trend glyphs for the gap
+    o._gapShortC           = TREND_NEUTRAL
+    o._gapLongG            = "-"
+    o._gapLongC            = TREND_NEUTRAL
     -- Static layer descriptors — point to the pre-allocated value arrays.
     -- drawBudget picks the right list each frame with zero allocation.
     o._layerListCapped = {
@@ -628,6 +633,59 @@ function ModProfilerPanel:refreshBudgetLayers()
     self._footerFreePct = budgetAvg > 0 and (self._footerAvgHr / budgetAvg * 100) or 0
 end
 
+function ModProfilerPanel:refreshGapStats()
+    -- Compute trend of the unattributed gap (engineMs = cpuMs - modMs).
+    -- A rising gap means something outside profiled Lua is growing: GC,
+    -- native engine work, asset decoding, physics, etc.
+    local ring = ModProfiler.getFrameBudgetRing and ModProfiler.getFrameBudgetRing()
+    local rg = ModProfiler.ringGet
+    local n = ring and ring.count or 0
+    if n < 2 then
+        self._fmtGapLine = ""
+        self._gapShortG = "-"; self._gapShortC = TREND_NEUTRAL
+        self._gapLongG  = "-"; self._gapLongC  = TREND_NEUTRAL
+        return
+    end
+
+    local scratch = self._scratch
+    local intervalSec = (ModProfiler.getIntervalSeconds and ModProfiler.getIntervalSeconds()) or 2
+    local sessionMin  = (ModProfiler.getSessionElapsedMinutes and ModProfiler.getSessionElapsedMinutes()) or 0
+
+    -- Fill scratch with engineMs values (time-ordered) for short trend.
+    local last = rg(ring, n)
+    local lastGap = last.engineMs or 0
+    local lastCpu = last.cpuMs or 0
+    local lastMod = last.modMs or 0
+    local sumGap = 0
+    for i = 1, n do
+        local v = (rg(ring, i)).engineMs or 0
+        scratch[i] = v
+        sumGap = sumGap + v
+    end
+    for i = n + 1, #scratch do scratch[i] = nil end
+    local avgGap = sumGap / n
+    local gapPct = lastCpu > 0 and (lastGap / lastCpu * 100) or 0
+
+    -- Short trend: is the gap growing within the live ring window?
+    local shortG, shortC = shortTrend(scratch, intervalSec)
+
+    -- Long trend: use the budget ring as-is (it's the only tier for gap).
+    -- For sessions > 30min we'd want a period ring, but budget ring is
+    -- our best available window for gap analysis.
+    local longG, longC
+    if sessionMin >= 3 and n >= 3 then
+        longG, longC = shortTrend(scratch, intervalSec)  -- reuse same window
+    else
+        longG, longC = "-", TREND_NEUTRAL
+    end
+
+    self._gapShortG = shortG; self._gapShortC = shortC
+    self._gapLongG  = longG;  self._gapLongC  = longC
+    self._fmtGapLine = string.format(
+        "Unattributed: %.1f ms (avg %.1f ms, %d%% of CPU)   mods: %.1f ms   total: %.1f ms",
+        lastGap, avgGap, gapPct + 0.5, lastMod, lastCpu)
+end
+
 function ModProfilerPanel:buildSelfCostRow()
     local dumpRing = ModProfiler.getSelfDumpRing and ModProfiler.getSelfDumpRing()
     if not dumpRing or dumpRing.count < 2 then return nil end
@@ -731,6 +789,7 @@ function ModProfilerPanel:prerender()
         ModProfiler.clearSnapshotDirty()
         self:refreshRows()
         self:refreshBudgetLayers()
+        self:refreshGapStats()
         self._cachedSelfRow = self:buildSelfCostRow()
         if self._budgetLast then
             self._cachedHeaderCpuMs    = self._budgetLast.cpuMs or 0
@@ -772,6 +831,22 @@ function ModProfilerPanel:prerender()
         y = y + 3
         self:drawRect(10, y, self:getWidth() - 20, 1, 0.30, 0.34, 0.40, 0.40)
         y = y + 6
+    end
+
+    -- Unattributed gap row: shows observed CPU minus profiled mods, with trend.
+    -- A rising trend here means hidden costs (GC, native, physics) are growing.
+    if #(self._fmtGapLine or "") > 0 then
+        -- Gap label + numbers
+        self:drawText(self._fmtGapLine, 10, y, TEXT_DIM.r, TEXT_DIM.g, TEXT_DIM.b, 1, font)
+        -- Trend glyphs at a fixed position near the right side
+        local trendX = self:getWidth() - 80
+        local g1 = self._gapShortG or "-"
+        local g2 = self._gapLongG or "-"
+        self:drawText("trend:", trendX - 50, y, TEXT_DIM.r, TEXT_DIM.g, TEXT_DIM.b, 1, font)
+        self:drawText(g1, trendX, y, self._gapShortC.r, self._gapShortC.g, self._gapShortC.b, 1, font)
+        local g1w = getTextManager():MeasureStringX(font, g1 .. " ")
+        self:drawText(g2, trendX + g1w, y, self._gapLongC.r, self._gapLongC.g, self._gapLongC.b, 1, font)
+        y = y + 16
     end
 
     local gx = 10
