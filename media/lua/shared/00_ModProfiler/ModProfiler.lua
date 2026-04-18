@@ -81,6 +81,7 @@ local _originalAdds     = {}
 local _originalRemoves  = {}
 local _origToWrapper    = {}
 local _wrapperToOrig    = {}
+local _wrapperToId      = {}   -- wrapper → callback-id; for cleanup on Remove
 local _interceptedCount = 0
 
 -- Tiered per-mod aggregation
@@ -301,6 +302,7 @@ local function interceptEvent(eventName)
 
         _origToWrapper[callback] = wrapped
         _wrapperToOrig[wrapped]  = callback
+        _wrapperToId[wrapped]    = id
         origAdd(wrapped)
     end
 
@@ -309,6 +311,8 @@ local function interceptEvent(eventName)
             local wrapper = _origToWrapper[callback]
             if wrapper then
                 origRemove(wrapper)
+                local cbId = _wrapperToId[wrapper]
+                if cbId then _callbacks[cbId] = nil; _wrapperToId[wrapper] = nil end
                 _origToWrapper[callback] = nil
                 _wrapperToOrig[wrapper]  = nil
             else

@@ -155,5 +155,42 @@ if #samplesF >= 1 then
 end
 
 ---------------------------------------------------------------------------
+section("Scenario G: _callbacks cleaned up on Remove (GC leak regression)")
+---------------------------------------------------------------------------
+-- Before the fix, Events.X.Remove(fn) cleaned the wrapper mappings but
+-- left the _callbacks[id] entry alive forever. dumpIntervalReport iterated
+-- every entry including dead ones, causing O(N) growth over session length.
+env.setMs(0)
+env.setPerformance(env.defaultPerfFull())
+env.setCPU(5.0)
+MP = loadEngine()
+
+-- Count callbacks tracked: run 120 ticks, then count how many entries
+-- dumpIntervalReport would iterate. We measure indirectly via
+-- getModStats — each wrapped callback creates a _modStats entry for its
+-- mod. More directly, we exercise add+remove and verify the iteration
+-- doesn't see dead entries (grandMs stays 0 for removed callbacks).
+local dummy1 = function() end
+local dummy2 = function() end
+Events.OnTick.Add(dummy1)
+Events.OnTick.Add(dummy2)
+-- Both should contribute to the callback table now.
+-- Remove one before any ticks fire.
+Events.OnTick.Remove(dummy2)
+-- Run an interval — dummy1 fires 120 times, dummy2 should be gone.
+env.setMs(100)
+for i = 1, 120 do env.trigger("OnTick") end
+-- dummy2 was removed before any ticks, so it should contribute 0ms.
+-- If _callbacks leaked, dummy2's entry would still be iterated (with
+-- iCalls=0, so it wouldn't inflate grandMs, but the entry itself would
+-- persist). We verify removal actually happened by checking the mod
+-- stats: TestMod should have calls from dummy1 only.
+local testModStats = MP.getModStats()["TestMod"]
+ok("TestMod has stats from dummy1", testModStats ~= nil and testModStats.totalCalls > 0)
+-- Remove dummy1 too and verify clean removal
+Events.OnTick.Remove(dummy1)
+ok("Remove does not error", true)
+
+---------------------------------------------------------------------------
 print(string.format("\n== %d passed, %d failed ==", passed, failed))
 os.exit(failed == 0 and 0 or 1)

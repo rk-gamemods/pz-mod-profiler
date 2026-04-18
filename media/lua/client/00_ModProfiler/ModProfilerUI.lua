@@ -240,12 +240,10 @@ local function drawHeader(panel, y, font)
     local enabled = ModProfiler.isEnabled and ModProfiler.isEnabled()
     local statusTxt = enabled and "[ON]" or "[OFF]"
 
-    -- Prefer engine-provided helpers; they do the safe nil-method probing.
-    local budgetMs = (ModProfiler.getTargetFrameMs and ModProfiler.getTargetFrameMs()) or (1000/60)
-    local cpuMs = 0
-    local samples = ModProfiler.getFrameBudgetSamples and ModProfiler.getFrameBudgetSamples() or {}
-    if #samples > 0 then cpuMs = samples[#samples].cpuMs or 0 end
-    local pct = budgetMs > 0 and (cpuMs / budgetMs * 100) or 0
+    -- Use cached values from the throttled refresh cycle (no per-frame alloc).
+    local budgetMs = panel._cachedHeaderBudgetMs or (1000/60)
+    local cpuMs    = panel._cachedHeaderCpuMs or 0
+    local pct      = panel._cachedHeaderPct or 0
 
     panel:drawText("PROFILER", 10, y, 0.82, 0.82, 0.85, 1, font)
     local afterLabelX = 10 + getTextManager():MeasureStringX(font, "PROFILER ")
@@ -325,8 +323,7 @@ local function drawStackedArea(panel, x, y, w, h, layers, budgetMs, font)
     end
 end
 
-local function drawBudget(panel, x, y, w, h, font)
-    local samples = (ModProfiler.getFrameBudgetSamples and ModProfiler.getFrameBudgetSamples()) or {}
+local function drawBudget(panel, x, y, w, h, font, samples)
     local n = #samples
     if n < 2 then
         panel:drawText("Frame budget: collecting data...", x, y, TEXT_DIM.r, TEXT_DIM.g, TEXT_DIM.b, 1, font)
@@ -446,6 +443,14 @@ function ModProfilerPanel:new(x, y, w, h)
     o.intervalTicks   = ModProfilerINI.num(ini, "intervalTicks", 120)
     o._ini            = ini
     o._comboW         = 90
+    -- Cached data: rebuilt at interval boundaries, not every frame.
+    -- This prevents ~9000 table allocations/sec from GC-choking Kahlua.
+    o._lastRefreshMs       = 0
+    o._cachedBudgetSamples = {}
+    o._cachedSelfRow       = nil
+    o._cachedHeaderCpuMs   = 0
+    o._cachedHeaderBudgetMs= 1000/60
+    o._cachedHeaderPct     = 0
     return o
 end
 
@@ -668,9 +673,27 @@ function ModProfilerPanel:prerender()
     -- the interval-progress bar doesn't visually cut through the title.
     local y = self:titleBarHeight() + 14
 
-    y = drawHeader(self, y, font)
+    -- CRITICAL PERF: Only rebuild rows / budget / self-cost when new
+    -- interval data is available. Between refreshes the cached tables
+    -- are reused for drawing — zero per-frame allocations.
+    -- Refresh at most every 500ms so even long intervals stay responsive.
+    local now = getTimestampMs()
+    if (now - self._lastRefreshMs) >= 500 then
+        self._lastRefreshMs = now
+        self:refreshRows()
+        self._cachedBudgetSamples = (ModProfiler.getFrameBudgetSamples and ModProfiler.getFrameBudgetSamples()) or {}
+        self._cachedSelfRow = self:buildSelfCostRow()
+        local bs = self._cachedBudgetSamples
+        if #bs > 0 then
+            local last = bs[#bs]
+            self._cachedHeaderCpuMs    = last.cpuMs or 0
+            self._cachedHeaderBudgetMs = last.budgetMs or (1000/60)
+        end
+        self._cachedHeaderPct = self._cachedHeaderBudgetMs > 0
+            and (self._cachedHeaderCpuMs / self._cachedHeaderBudgetMs * 100) or 0
+    end
 
-    self:refreshRows()
+    y = drawHeader(self, y, font)
 
     y = drawColHeader(self, y + 4, font, self.sortColumn, self.sortDescending)
     self._tableHeaderY = y - 18
@@ -681,7 +704,7 @@ function ModProfilerPanel:prerender()
     end
     self._tableBottomY = y
 
-    local selfRow = self:buildSelfCostRow()
+    local selfRow = self._cachedSelfRow
     if selfRow then
         self:drawRect(10, y + 2, self:getWidth() - 20, 1, 0.30, 0.34, 0.40, 0.40)
         y = y + 6
@@ -696,7 +719,7 @@ function ModProfilerPanel:prerender()
     local available = self:getHeight() - y - 12
     local gh = math.max(80, math.min(180, math.floor(available)))
     if gh > 40 then
-        y = drawBudget(self, gx, y + 6, gw, gh, font)
+        y = drawBudget(self, gx, y + 6, gw, gh, font, self._cachedBudgetSamples)
     end
 end
 
