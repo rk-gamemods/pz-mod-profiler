@@ -1,0 +1,37 @@
+
+== Compile media/lua/shared/00_ModProfiler/ModProfiler.lua ==
++ C:\Users\Admin\AppData\Local\Programs\Lua\bin\lua.exe -e assert(loadfile([[media/lua/shared/00_ModProfiler/ModProfiler.lua]]))
+
+== Compile media/lua/client/00_ModProfiler/ModProfilerUI.lua ==
++ C:\Users\Admin\AppData\Local\Programs\Lua\bin\lua.exe -e assert(loadfile([[media/lua/client/00_ModProfiler/ModProfilerUI.lua]]))
+
+== Compile media/lua/client/00_ModProfiler/ModProfilerKeys.lua ==
++ C:\Users\Admin\AppData\Local\Programs\Lua\bin\lua.exe -e assert(loadfile([[media/lua/client/00_ModProfiler/ModProfilerKeys.lua]]))
+
+== Lua unit tests ==
++ C:\Users\Admin\AppData\Local\Programs\Lua\bin\lua.exe test/lua/run_unit_tests.lua
+[01/04] setIntervalTicks clamps supported bounds ... ok
+[02/04] display interval records mod live samples and frame budget ... ok
+[03/04] self-cost is recorded as synthetic profiler mod ... ok
+[04/04] resetSession clears derived rings but wrapped callbacks still work ... ok
+
+Lua unit tests: 4 passed, 0 failed
+
+== PZ codebase API validation ==
+Using PZCodebase root: C:\Users\Admin\Documents\GIT\GameMods\PZMods\PZCodebase
+OK token getTimestampMs -> Java\source\zombie\Lua\LuaManager.java
+OK token getFilenameOfClosure -> Java\source\zombie\Lua\LuaManager.java
+OK token getFirstLineOfClosure -> Java\source\zombie\Lua\LuaManager.java
+OK token getAverageFPS -> Java\source\zombie\Lua\LuaManager.java
+OK token getPerformance -> Java\source\zombie\Lua\LuaManager.java
+OK token getFramerate -> Java\source\zombie\core\PerformanceSettings.java
+OK token isFramerateUncapped -> Java\source\zombie\core\Core.java
+OK token Clipboard.setClipboard -> Java\source\zombie\ui\AtomUITextEntry.java
+OK token getFileReader -> Java\source\zombie\Lua\LuaManager.java
+OK token getFileWriter -> Java\source\zombie\Lua\LuaManager.java
+OK token getCore -> Java\source\zombie\characters\BodyDamage\Thermoregulator.java
+OK path Lua/client/ISUI/ISCollapsableWindow.lua
+OK path Lua/client/ISUI/ISComboBox.lua
+
+API contract validation failed:
+- Contract source drift: 'getCPUTime' not found in media/lua/shared/00_ModProfiler/ModProfiler.lua (CPU timing API used by engine and UI)
