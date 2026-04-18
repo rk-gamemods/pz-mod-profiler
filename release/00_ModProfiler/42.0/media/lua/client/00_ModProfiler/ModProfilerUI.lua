@@ -1,0 +1,736 @@
+-- ModProfilerUI.lua
+-- Overlay for 00_ModProfiler. Full redesign per dev/2026-04-18-ui-redesign-implementation-plan.md
+-- with user-directed overrides:
+--   * single muted off-white for all row text (no p95-based tint)
+--   * UIFont.Small throughout
+--   * desaturated graph — single accent hue at varying alpha
+--   * ISCollapsableWindow handles createChildren — never call it manually
+--   * engine band labeled "Engine + unattributed"
+
+require "ISUI/ISCollapsableWindow"
+require "ISUI/ISComboBox"
+
+---------------------------------------------------------------------------
+-- ModProfilerINI — key=value persistence in Zomboid Lua dir
+---------------------------------------------------------------------------
+local INI_FILENAME = "ModProfiler.ini"
+
+local function iniParse(lines)
+    local t = {}
+    for _, line in ipairs(lines) do
+        local k, v = line:match("^%s*([%w_%.]+)%s*=%s*(.-)%s*$")
+        if k then t[k] = v end
+    end
+    return t
+end
+
+local function iniSerialize(tbl)
+    local keys = {}
+    for k in pairs(tbl) do keys[#keys+1] = k end
+    table.sort(keys)
+    local out = {}
+    for _, k in ipairs(keys) do out[#out+1] = k .. "=" .. tostring(tbl[k]) end
+    return out
+end
+
+local ModProfilerINI = {}
+
+function ModProfilerINI.load()
+    local reader = getFileReader(INI_FILENAME, false)
+    if not reader then return {} end
+    local lines = {}
+    while true do
+        local line = reader:readLine()
+        if not line then break end
+        lines[#lines+1] = line
+    end
+    reader:close()
+    return iniParse(lines)
+end
+
+function ModProfilerINI.save(tbl)
+    local writer = getFileWriter(INI_FILENAME, true, false)
+    if not writer then return end
+    for _, line in ipairs(iniSerialize(tbl)) do
+        writer:write(line .. "\n")
+    end
+    writer:close()
+end
+
+function ModProfilerINI.num(tbl, key, default)
+    local v = tonumber(tbl[key]); if v == nil then return default end; return v
+end
+function ModProfilerINI.bool(tbl, key, default)
+    local v = tbl[key]
+    if v == "true" then return true end
+    if v == "false" then return false end
+    return default
+end
+function ModProfilerINI.str(tbl, key, default) return tbl[key] or default end
+function ModProfilerINI.list(tbl, key)
+    local s = tbl[key]; if not s or s == "" then return {} end
+    local out = {}; for w in s:gmatch("([^,]+)") do out[#out+1] = w end
+    return out
+end
+
+---------------------------------------------------------------------------
+-- Pure helpers
+---------------------------------------------------------------------------
+local function percentile(sortedArr, pct)
+    local n = #sortedArr
+    if n == 0 then return 0 end
+    if n == 1 then return sortedArr[1] end
+    local rank = (pct / 100) * (n - 1) + 1
+    local lo = math.floor(rank); local hi = math.ceil(rank)
+    if lo == hi then return sortedArr[lo] end
+    local frac = rank - lo
+    return sortedArr[lo] * (1 - frac) + sortedArr[hi] * frac
+end
+
+local function olsSlope(ys)
+    local n = #ys
+    if n < 2 then return nil, 0 end
+    local sumX, sumY = 0, 0
+    for i = 1, n do sumX = sumX + i; sumY = sumY + ys[i] end
+    local meanX, meanY = sumX/n, sumY/n
+    local num, den = 0, 0
+    for i = 1, n do
+        local dx = i - meanX; local dy = ys[i] - meanY
+        num = num + dx * dy
+        den = den + dx * dx
+    end
+    if den == 0 then return 0, meanY end
+    return num / den, meanY
+end
+
+-- Neutral / muted trend colors — no strong hue shifts.
+local TREND_NEUTRAL = { r=0.60, g=0.60, b=0.62, a=1 }
+local TREND_RISING  = { r=0.82, g=0.70, b=0.55, a=1 }
+local TREND_FALLING = { r=0.55, g=0.70, b=0.82, a=1 }
+
+local function trendGlyph(pctPerUnit, thresholdRising, thresholdFalling, minSamples, nSamples)
+    if nSamples < minSamples then return "-", TREND_NEUTRAL end
+    if pctPerUnit == nil then return "-", TREND_NEUTRAL end
+    if pctPerUnit > thresholdRising  then return "^", TREND_RISING end
+    if pctPerUnit < thresholdFalling then return "v", TREND_FALLING end
+    return ">", TREND_NEUTRAL
+end
+
+local function shortTrend(liveRing, intervalSec)
+    local n = #liveRing
+    if n < 10 then return "-", TREND_NEUTRAL, 0 end
+    local ys = {}
+    for i = 1, n do ys[i] = liveRing[i].msPerFrame or 0 end
+    local slopePerSample, mean = olsSlope(ys)
+    if not slopePerSample or mean <= 0 then return ">", TREND_NEUTRAL, 0 end
+    local slopePerMin = slopePerSample * (60 / intervalSec)
+    local pctPerMin = slopePerMin / mean * 100
+    local g, c = trendGlyph(pctPerMin, 2, -2, 10, n)
+    return g, c, pctPerMin
+end
+
+local function longTrend(minuteRing, periodRing, sessionMin)
+    local src, sampleMin
+    if sessionMin < 30 then src, sampleMin = minuteRing, 1
+    else src, sampleMin = periodRing, 5 end
+    local n = #src
+    if sessionMin < 3 or n < 3 then return "-", TREND_NEUTRAL, 0 end
+    local ys = {}
+    for i = 1, n do ys[i] = src[i].msPerFrame or 0 end
+    local slopePerSample, mean = olsSlope(ys)
+    if not slopePerSample or mean <= 0 then return ">", TREND_NEUTRAL, 0 end
+    local slopePerHour = slopePerSample * (60 / sampleMin)
+    local pctPerHour = slopePerHour / mean * 100
+    local g, c = trendGlyph(pctPerHour, 2, -2, 3, n)
+    return g, c, pctPerHour
+end
+
+local function spikesPerMin(liveRing, intervalSec)
+    local n = #liveRing
+    if n < 10 then return nil end
+    local sum = 0
+    for i = 1, n do sum = sum + (liveRing[i].spikes or 0) end
+    local windowMin = (n * intervalSec) / 60
+    if windowMin <= 0 then return 0 end
+    return sum / windowMin
+end
+
+---------------------------------------------------------------------------
+-- Shared palette (muted)
+---------------------------------------------------------------------------
+local TEXT_MUTED  = { r=0.82, g=0.82, b=0.80, a=1 }   -- single row-text color
+local TEXT_HEADER = { r=0.70, g=0.72, b=0.78, a=1 }
+local TEXT_DIM    = { r=0.58, g=0.58, b=0.62, a=1 }
+
+-- Single accent hue for interactive bits: slate cyan.
+local ACCENT = { r=0.45, g=0.60, b=0.70 }
+
+-- Frame-budget graph: three muted tones with real lightness separation.
+-- Dark = unused headroom, mid = engine/unattributed, light = mod work.
+-- Separated by lightness (not hue) keeps the muted aesthetic and survives
+-- both dark and bright game backgrounds.
+local BG_HEADROOM = { r=0.18, g=0.21, b=0.24, a=0.95 }  -- near-black slate
+local BG_ENGINE   = { r=0.42, g=0.47, b=0.52, a=0.95 }  -- mid steel
+local BG_MODS     = { r=0.78, g=0.80, b=0.82, a=0.98 }  -- off-white
+local BUDGET_LINE = { r=0.95, g=0.78, b=0.45, a=0.90 }  -- warm amber — stands out
+
+-- The mod name the profiler attributes to its own Lua files. Kept in sync
+-- with extractModName() in ModProfiler.lua.
+local SELF_MOD_NAME = "00_ModProfiler"
+
+---------------------------------------------------------------------------
+-- Column layout
+---------------------------------------------------------------------------
+local COLS = {
+    { key="name",         label="Mod",      x=10,  w=220, align="left"  },
+    { key="pctTotal",     label="%Total",   x=240, w=70,  align="right" },
+    { key="p50",          label="ms/f p50", x=320, w=90,  align="right" },
+    { key="p95",          label="ms/f p95", x=420, w=90,  align="right" },
+    { key="spikesPerMin", label="spk/min",  x=520, w=80,  align="right" },
+    { key="trend",        label="trend",    x=610, w=60,  align="center"},
+}
+
+local function drawColHeader(panel, y, font, sortKey, sortDesc)
+    for _, c in ipairs(COLS) do
+        local label = c.label
+        if c.key == sortKey then label = label .. (sortDesc and " v" or " ^") end
+        if c.align == "right" then
+            local tw = getTextManager():MeasureStringX(font, label)
+            panel:drawText(label, c.x + c.w - tw, y, TEXT_HEADER.r, TEXT_HEADER.g, TEXT_HEADER.b, 1, font)
+        elseif c.align == "center" then
+            local tw = getTextManager():MeasureStringX(font, label)
+            panel:drawText(label, c.x + (c.w - tw)/2, y, TEXT_HEADER.r, TEXT_HEADER.g, TEXT_HEADER.b, 1, font)
+        else
+            panel:drawText(label, c.x, y, TEXT_HEADER.r, TEXT_HEADER.g, TEXT_HEADER.b, 1, font)
+        end
+    end
+    panel:drawRect(10, y + 14, panel:getWidth() - 20, 1, 0.35, 0.40, 0.50, 0.30)
+    return y + 18
+end
+
+local function drawModRow(panel, row, y, font)
+    if row.pinned then
+        panel:drawRect(8, y - 1, panel:getWidth() - 16, 15, 0.35, 0.35, 0.20, 0.12)
+    end
+    local col = TEXT_MUTED
+    local nameStr = (row.pinned and "* " or "  ") .. (row.mod or "?")
+    panel:drawText(nameStr, COLS[1].x, y, col.r, col.g, col.b, 1, font)
+    local function R(txt, c)
+        local tw = getTextManager():MeasureStringX(font, txt)
+        panel:drawText(txt, c.x + c.w - tw, y, col.r, col.g, col.b, 1, font)
+    end
+    R(string.format("%.1f%%", row.pctTotal or 0), COLS[2])
+    R(string.format("%.2f ms", row.p50 or 0), COLS[3])
+    R(string.format("%.2f ms", row.p95 or 0), COLS[4])
+    R(row.spikesPerMin and string.format("%.1f", row.spikesPerMin) or "-", COLS[5])
+    local g1 = row.shortG or "-"; local g2 = row.longG or "-"
+    local pair = g1 .. " " .. g2
+    local tw = getTextManager():MeasureStringX(font, pair)
+    local tx = COLS[6].x + (COLS[6].w - tw)/2
+    panel:drawText(g1, tx, y, row.shortC.r, row.shortC.g, row.shortC.b, 1, font)
+    local g1w = getTextManager():MeasureStringX(font, g1 .. " ")
+    panel:drawText(g2, tx + g1w, y, row.longC.r, row.longC.g, row.longC.b, 1, font)
+end
+
+---------------------------------------------------------------------------
+-- Header (status + CPU/budget + interval bar). Rate combo is a real child
+-- widget positioned independently — see createChildren / onResize.
+---------------------------------------------------------------------------
+local function drawHeader(panel, y, font)
+    local enabled = ModProfiler.isEnabled and ModProfiler.isEnabled()
+    local statusTxt = enabled and "[ON]" or "[OFF]"
+
+    -- Prefer engine-provided helpers; they do the safe nil-method probing.
+    local budgetMs = (ModProfiler.getTargetFrameMs and ModProfiler.getTargetFrameMs()) or (1000/60)
+    local cpuMs = 0
+    local samples = ModProfiler.getFrameBudgetSamples and ModProfiler.getFrameBudgetSamples() or {}
+    if #samples > 0 then cpuMs = samples[#samples].cpuMs or 0 end
+    local pct = budgetMs > 0 and (cpuMs / budgetMs * 100) or 0
+
+    panel:drawText("PROFILER", 10, y, 0.82, 0.82, 0.85, 1, font)
+    local afterLabelX = 10 + getTextManager():MeasureStringX(font, "PROFILER ")
+    panel:drawText(statusTxt, afterLabelX, y, TEXT_MUTED.r, TEXT_MUTED.g, TEXT_MUTED.b, 1, font)
+
+    local bigStr = string.format("%.1f / %.1f ms frame (%d%%)", cpuMs, budgetMs, pct+0.5)
+    if panel:getWidth() < 700 then bigStr = string.format("%.1f/%.1fms", cpuMs, budgetMs) end
+    local bigX = afterLabelX + getTextManager():MeasureStringX(font, statusTxt .. "  ")
+    panel:drawText(bigStr, bigX, y, TEXT_MUTED.r, TEXT_MUTED.g, TEXT_MUTED.b, 1, font)
+
+    -- "rate" label sits left of the rate combo (which is a child widget).
+    local rateLabelX = panel:getWidth() - 140
+    panel:drawText("rate", rateLabelX, y, TEXT_DIM.r, TEXT_DIM.g, TEXT_DIM.b, 1, font)
+
+    -- Interval progress bar drawn on its own line beneath the header text.
+    local totalTicks = (ModProfiler.getIntervalTicks and ModProfiler.getIntervalTicks()) or 120
+    local curTicks   = (ModProfiler.getTickCount and ModProfiler.getTickCount()) or 0
+    local frac = math.max(0, math.min(1, curTicks / totalTicks))
+    local barY = y + 18
+    local barX, barW, barH = 10, panel:getWidth() - 20, 3
+    panel:drawRect(barX, barY, barW, barH, 0.22, 0.24, 0.28, 0.60)
+    panel:drawRect(barX, barY, math.floor(barW * frac), barH, ACCENT.r, ACCENT.g, ACCENT.b, 0.80)
+
+    return barY + barH + 4   -- y-cursor below the bar with a little breathing room
+end
+
+---------------------------------------------------------------------------
+-- Frame-budget stacked area (single-hue, "Engine + unattributed")
+---------------------------------------------------------------------------
+local function drawStackedArea(panel, x, y, w, h, layers, budgetMs, font)
+    -- Find Y-axis max across stacked totals
+    local n = 0
+    for _, L in ipairs(layers) do if #L.values > n then n = #L.values end end
+    if n < 2 then return end
+    local maxY = 0
+    for i = 1, n do
+        local sum = 0
+        for _, L in ipairs(layers) do sum = sum + (L.values[i] or 0) end
+        if sum > maxY then maxY = sum end
+    end
+    if budgetMs and budgetMs > maxY then maxY = budgetMs end
+    if maxY <= 0 then maxY = 1 end
+
+    -- Background
+    panel:drawRect(x, y, w, h, 0.10, 0.11, 0.13, 0.80)
+
+    -- Stacked bars, left-to-right, one column per sample.
+    -- Use integer math on pixel boundaries so adjacent columns ABUT
+    -- instead of overlapping by 1px (which visually merges the bars
+    -- and kills the stacked-area look).
+    local colFloatW = w / n
+    for i = 1, n do
+        local cx      = x + math.floor((i - 1) * colFloatW)
+        local cxNext  = x + math.floor(i * colFloatW)
+        local pixelW  = cxNext - cx
+        if pixelW < 1 then pixelW = 1 end
+        local stackY = y + h
+        for _, L in ipairs(layers) do
+            local v = L.values[i] or 0
+            local barH = (v / maxY) * h
+            panel:drawRect(cx, stackY - barH, pixelW, barH, L.r, L.g, L.b, L.a)
+            stackY = stackY - barH
+        end
+    end
+
+    -- Budget line (dashed) — warm amber so it reads as a distinct marker
+    -- against any of the grey/steel band tones.
+    if budgetMs then
+        local ly = y + h - (budgetMs / maxY) * h
+        local segW = 6; local gapW = 4; local step = segW + gapW
+        local xi = x
+        while xi < x + w do
+            local segEnd = math.min(xi + segW, x + w)
+            panel:drawRect(xi, ly, segEnd - xi, 1, BUDGET_LINE.r, BUDGET_LINE.g, BUDGET_LINE.b, BUDGET_LINE.a)
+            xi = xi + step
+        end
+    end
+end
+
+local function drawBudget(panel, x, y, w, h, font)
+    local samples = (ModProfiler.getFrameBudgetSamples and ModProfiler.getFrameBudgetSamples()) or {}
+    local n = #samples
+    if n < 2 then
+        panel:drawText("Frame budget: collecting data...", x, y, TEXT_DIM.r, TEXT_DIM.g, TEXT_DIM.b, 1, font)
+        return y + 16
+    end
+
+    local last = samples[n]
+    local uncappedLast = last.uncapped == true
+    local title = uncappedLast and "FRAME BUDGET (UNCAPPED)" or "FRAME BUDGET"
+    panel:drawText(title, x, y, TEXT_HEADER.r, TEXT_HEADER.g, TEXT_HEADER.b, 1, font)
+
+    local overBy = last.cpuMs - last.budgetMs
+    if overBy > 0 and not uncappedLast then
+        local blink = (getTimestampMs() % 1000) < 500
+        if blink then
+            panel:drawText(string.format("! OVER BUDGET: +%.1fms", overBy),
+                           x + 180, y, 0.85, 0.55, 0.50, 1, font)
+        end
+    end
+
+    -- Generous padding so the title never gets painted over by the
+    -- topmost stacked bar (e.g. mod band on a heavy interval).
+    local titlePad = 22
+    local gy = y + titlePad
+    local footerPad = 14
+    local gh = h - titlePad - footerPad
+
+    local headroom, engine, mods = {}, {}, {}
+    for i = 1, n do
+        headroom[i] = uncappedLast and 0 or (samples[i].headroomMs or 0)
+        engine[i]   = samples[i].engineMs or 0
+        mods[i]     = samples[i].modMs    or 0
+    end
+
+    -- Three distinct LIGHTNESS tones (not alpha variants of one color).
+    -- Bottom-up draw order: headroom -> engine -> mods so the stack reads
+    -- as "dark floor = unused time, mid = engine, bright crown = mods."
+    local layerList = {
+        { name="Headroom",             values=headroom, r=BG_HEADROOM.r, g=BG_HEADROOM.g, b=BG_HEADROOM.b, a=BG_HEADROOM.a },
+        { name="Engine + unattributed",values=engine,   r=BG_ENGINE.r,   g=BG_ENGINE.g,   b=BG_ENGINE.b,   a=BG_ENGINE.a },
+        { name="Mods",                 values=mods,     r=BG_MODS.r,     g=BG_MODS.g,     b=BG_MODS.b,     a=BG_MODS.a },
+    }
+    if uncappedLast then table.remove(layerList, 1) end
+
+    drawStackedArea(panel, x, gy, w, gh, layerList, uncappedLast and nil or last.budgetMs, font)
+
+    -- Legend row (single line, muted). Budget-line swatch included so the
+    -- amber dashed line is self-explanatory.
+    local legendY = gy + gh + 2
+    local lx = x
+    for _, L in ipairs(layerList) do
+        panel:drawRect(lx, legendY + 3, 8, 6, L.r, L.g, L.b, L.a)
+        panel:drawText(L.name, lx + 12, legendY, TEXT_DIM.r, TEXT_DIM.g, TEXT_DIM.b, 1, font)
+        lx = lx + 14 + getTextManager():MeasureStringX(font, L.name) + 12
+    end
+    if not uncappedLast then
+        panel:drawRect(lx, legendY + 5, 8, 1, BUDGET_LINE.r, BUDGET_LINE.g, BUDGET_LINE.b, BUDGET_LINE.a)
+        panel:drawText("budget", lx + 12, legendY, TEXT_DIM.r, TEXT_DIM.g, TEXT_DIM.b, 1, font)
+    end
+
+    -- Footer stats
+    local sumHr, minHr, maxHr = 0, math.huge, -math.huge
+    local budgetAvg = 0
+    for i = 1, n do
+        local hr = samples[i].headroomMs or 0
+        sumHr = sumHr + hr
+        if hr < minHr then minHr = hr end
+        if hr > maxHr then maxHr = hr end
+        budgetAvg = budgetAvg + (samples[i].budgetMs or 16.67)
+    end
+    local avgHr = sumHr / n
+    budgetAvg = budgetAvg / n
+    local freePct = budgetAvg > 0 and (avgHr / budgetAvg * 100) or 0
+    local footer = string.format("Avg headroom: %.1f ms (%d%% free)   min: %.1f   max: %.1f",
+                                 avgHr, freePct+0.5, minHr, maxHr)
+    panel:drawText(footer, x, y + h + 2, TEXT_DIM.r, TEXT_DIM.g, TEXT_DIM.b, 1, font)
+
+    -- Coverage-boundary note: the profiler only wraps Lua event callbacks
+    -- registered via Events.X.Add. Native engine work (rendering, asset
+    -- decoding, physics, script-parsing for .txt files in other mods)
+    -- shows up in the total cpuMs but gets attributed to the Engine band
+    -- because there's no Lua hook to intercept it.
+    local note = "Mods band = profiled Lua callbacks only; native/asset cost rolls into Engine band."
+    panel:drawText(note, x, y + h + 14, TEXT_DIM.r, TEXT_DIM.g, TEXT_DIM.b, 0.75, font)
+
+    return y + h + 28
+end
+
+---------------------------------------------------------------------------
+-- Panel class
+---------------------------------------------------------------------------
+ModProfilerPanel = ISCollapsableWindow:derive("ModProfilerPanel")
+
+function ModProfilerPanel:new(x, y, w, h)
+    local ini = ModProfilerINI.load()
+    local defaultX, defaultY = 40, 40
+    local defaultW, defaultH = 820, 560
+
+    x = ModProfilerINI.num(ini, "x", x or defaultX)
+    y = ModProfilerINI.num(ini, "y", y or defaultY)
+    w = ModProfilerINI.num(ini, "w", w or defaultW)
+    h = ModProfilerINI.num(ini, "h", h or defaultH)
+
+    local o = ISCollapsableWindow:new(x, y, w, h)
+    setmetatable(o, self)
+    self.__index = self
+    o.title           = "Mod Profiler"
+    o.resizable       = true
+    o.drawFrame       = true
+    o.backgroundColor = { r=0.05, g=0.06, b=0.08, a=0.92 }
+    o.borderColor     = { r=0.30, g=0.34, b=0.40, a=1.00 }
+    o.topN            = 20
+    o.pinned          = {}
+    for _, m in ipairs(ModProfilerINI.list(ini, "pinned")) do o.pinned[m] = true end
+    o.sortColumn      = ModProfilerINI.str(ini, "sortColumn", "pctTotal")
+    o.sortDescending  = ModProfilerINI.bool(ini, "sortDescending", true)
+    o.intervalTicks   = ModProfilerINI.num(ini, "intervalTicks", 120)
+    o._ini            = ini
+    o._comboW         = 90
+    return o
+end
+
+function ModProfilerPanel:createChildren()
+    ISCollapsableWindow.createChildren(self)
+
+    -- Align with drawHeader()'s header-text baseline:
+    --   y = titleBarHeight() + 14 (text row). We drop 2px so the combo
+    --   sits vertically centered next to the "rate" label and clear of
+    --   the interval progress bar drawn below.
+    local cW, cH = self._comboW, 20
+    local comboY = self:titleBarHeight() + 12
+    self.rateCombo = ISComboBox:new(self:getWidth() - cW - 12, comboY, cW, cH,
+                                    self, ModProfilerPanel.onRateChanged)
+    self.rateCombo.font = UIFont.Small
+    self.rateCombo:initialise()
+    self:addChild(self.rateCombo)
+    self.rateCombo:addOption("10s")
+    self.rateCombo:addOption("5s")
+    self.rateCombo:addOption("2s")
+    self.rateCombo:addOption("1s")
+    self.rateCombo:addOption("0.5s")
+    self.rateCombo:addOption("0.1s")
+    local map = { [600]=1, [300]=2, [120]=3, [60]=4, [30]=5, [6]=6 }
+    self.rateCombo.selected = map[self.intervalTicks] or 3
+end
+
+function ModProfilerPanel:onRateChanged(combo)
+    local ticksByIdx = { 600, 300, 120, 60, 30, 6 }
+    local ticks = ticksByIdx[combo.selected] or 120
+    self.intervalTicks = ticks
+    if ModProfiler.setIntervalTicks then ModProfiler.setIntervalTicks(ticks) end
+end
+
+function ModProfilerPanel:onResize()
+    ISCollapsableWindow.onResize(self)
+    if self.rateCombo then
+        self.rateCombo:setX(self:getWidth() - self._comboW - 12)
+        self.rateCombo:setY(self:titleBarHeight() + 12)
+    end
+end
+
+function ModProfilerPanel:close()
+    local pinnedList = {}
+    for k, v in pairs(self.pinned) do if v then pinnedList[#pinnedList+1] = k end end
+    local t = self._ini or {}
+    t.x              = math.floor(self:getX())
+    t.y              = math.floor(self:getY())
+    t.w              = math.floor(self:getWidth())
+    t.h              = math.floor(self:getHeight())
+    t.visible        = "false"
+    t.pinned         = table.concat(pinnedList, ",")
+    t.sortColumn     = self.sortColumn or "pctTotal"
+    t.sortDescending = self.sortDescending and "true" or "false"
+    t.intervalTicks  = tostring(self.intervalTicks or 120)
+    ModProfilerINI.save(t)
+    ISCollapsableWindow.close(self)
+end
+
+---------------------------------------------------------------------------
+-- Row builders
+---------------------------------------------------------------------------
+function ModProfilerPanel:refreshRows()
+    local intervalSec = (ModProfiler.getIntervalSeconds and ModProfiler.getIntervalSeconds()) or 2
+    local sessionMin  = (ModProfiler.getSessionElapsedMinutes and ModProfiler.getSessionElapsedMinutes()) or 0
+    local names = (ModProfiler.getAllModNames and ModProfiler.getAllModNames()) or {}
+    local rows = {}
+    local sumLiveMs = 0
+
+    -- The profiler reports its own cost in a dedicated self-cost row below
+    -- the main table. Exclude it here so it doesn't double-report.
+    local perModLive = {}
+    for _, m in ipairs(names) do
+        if m ~= SELF_MOD_NAME then
+            local live = ModProfiler.getModLiveSamples(m) or {}
+            perModLive[m] = live
+            local s = 0
+            for i = 1, #live do s = s + (live[i].msPerFrame or 0) end
+            sumLiveMs = sumLiveMs + s
+        end
+    end
+
+    for _, m in ipairs(names) do
+        local live = perModLive[m]
+        if live and #live > 0 then
+            local ys = {}
+            for i = 1, #live do ys[i] = live[i].msPerFrame end
+            table.sort(ys)
+            local p50 = percentile(ys, 50)
+            local p95 = percentile(ys, 95)
+            local modTotal = 0
+            for i = 1, #ys do modTotal = modTotal + ys[i] end
+            local pctTotal = sumLiveMs > 0 and (modTotal / sumLiveMs * 100) or 0
+
+            local shortG, shortC = shortTrend(live, intervalSec)
+            local longG,  longC  = longTrend(
+                ModProfiler.getModMinuteSamples(m) or {},
+                ModProfiler.getModPeriodSamples(m) or {},
+                sessionMin)
+            local spk = spikesPerMin(live, intervalSec)
+
+            rows[#rows+1] = {
+                mod = m, pctTotal = pctTotal, p50 = p50, p95 = p95,
+                spikesPerMin = spk,
+                shortG = shortG, shortC = shortC,
+                longG = longG, longC = longC,
+                pinned = self.pinned[m] == true,
+            }
+        end
+    end
+
+    local col  = self.sortColumn or "pctTotal"
+    local desc = self.sortDescending ~= false
+    local function cmp(a, b)
+        if a.pinned ~= b.pinned then return a.pinned end
+        local av, bv
+        if col == "name" then av, bv = a.mod, b.mod
+        else av, bv = a[col] or -1, b[col] or -1 end
+        if av == bv then return a.mod < b.mod end
+        if desc then return av > bv else return av < bv end
+    end
+    table.sort(rows, cmp)
+
+    local displayed = {}
+    for _, r in ipairs(rows) do
+        if r.pinned or #displayed < self.topN then displayed[#displayed+1] = r end
+    end
+    self.rows = displayed
+end
+
+function ModProfilerPanel:buildSelfCostRow()
+    if not ModProfiler.getSelfStats then return nil end
+    local sstats = ModProfiler.getSelfStats()
+    if not sstats then return nil end
+    local intervalSec = (ModProfiler.getIntervalSeconds and ModProfiler.getIntervalSeconds()) or 2
+    local intervalTicks = intervalSec * 60
+    if intervalTicks <= 0 then return nil end
+
+    local dumpArr = sstats.intervalDumpMs or {}
+    local wrapMean = sstats.wrapperPerCallMs or 0
+
+    local callsPerInterval = 0
+    local modStats = ModProfiler.getModStats and ModProfiler.getModStats() or {}
+    local totMin = (ModProfiler.getSessionElapsedMinutes and ModProfiler.getSessionElapsedMinutes()) or 0
+    local totalCalls = 0
+    for _, s in pairs(modStats) do totalCalls = totalCalls + (s.totalCalls or 0) end
+    if totMin > 0 then
+        local totalIntervals = (totMin * 60) / intervalSec
+        if totalIntervals > 0 then callsPerInterval = totalCalls / totalIntervals end
+    end
+
+    local samples = {}
+    for i = 1, #dumpArr do
+        local d = dumpArr[i] or 0
+        local perInterval = wrapMean * callsPerInterval + d
+        samples[i] = perInterval / intervalTicks
+    end
+    if #samples < 2 then return nil end
+    local sorted = {}; for i = 1, #samples do sorted[i] = samples[i] end; table.sort(sorted)
+    local p50 = percentile(sorted, 50)
+    local p95 = percentile(sorted, 95)
+
+    return {
+        mod = "00_ModProfiler",
+        pctTotal = 0, p50 = p50, p95 = p95,
+        spikesPerMin = 0,
+        shortG = ">", shortC = TREND_NEUTRAL,
+        longG  = ">", longC  = TREND_NEUTRAL,
+        pinned = false,
+    }
+end
+
+---------------------------------------------------------------------------
+-- Mouse interaction
+---------------------------------------------------------------------------
+function ModProfilerPanel:onMouseDown(x, y)
+    if self._tableHeaderY and y >= self._tableHeaderY and y <= self._tableHeaderY + 18 then
+        for _, c in ipairs(COLS) do
+            if x >= c.x and x <= c.x + c.w then
+                if self.sortColumn == c.key then
+                    self.sortDescending = not self.sortDescending
+                else
+                    self.sortColumn = c.key
+                    self.sortDescending = (c.key ~= "name")
+                end
+                return
+            end
+        end
+    end
+    if self._tableHeaderY and self.rows and y > self._tableHeaderY + 18 and y <= (self._tableBottomY or 0) then
+        local idx = math.floor((y - (self._tableHeaderY + 18)) / 15) + 1
+        local r = self.rows[idx]
+        if r then
+            if self.pinned[r.mod] then self.pinned[r.mod] = nil else self.pinned[r.mod] = true end
+        end
+    end
+    ISCollapsableWindow.onMouseDown(self, x, y)
+end
+
+function ModProfilerPanel:onRightMouseDown(x, y)
+    if self._tableHeaderY and self.rows and y > self._tableHeaderY + 18 and y <= (self._tableBottomY or 0) then
+        local idx = math.floor((y - (self._tableHeaderY + 18)) / 15) + 1
+        local r = self.rows[idx]
+        if r and Clipboard and Clipboard.setClipboard then
+            pcall(Clipboard.setClipboard, r.mod)
+        end
+    end
+    ISCollapsableWindow.onRightMouseDown(self, x, y)
+end
+
+---------------------------------------------------------------------------
+-- prerender
+---------------------------------------------------------------------------
+function ModProfilerPanel:prerender()
+    ISCollapsableWindow.prerender(self)
+    local font = UIFont.Small
+    -- titleBarHeight() returns the height of the drag/title region.
+    -- ISCollapsableWindow also reserves a 1px chrome separator line
+    -- just under it; start header content well clear of that line so
+    -- the interval-progress bar doesn't visually cut through the title.
+    local y = self:titleBarHeight() + 14
+
+    y = drawHeader(self, y, font)
+
+    self:refreshRows()
+
+    y = drawColHeader(self, y + 4, font, self.sortColumn, self.sortDescending)
+    self._tableHeaderY = y - 18
+
+    for _, r in ipairs(self.rows or {}) do
+        drawModRow(self, r, y, font)
+        y = y + 15
+    end
+    self._tableBottomY = y
+
+    local selfRow = self:buildSelfCostRow()
+    if selfRow then
+        self:drawRect(10, y + 2, self:getWidth() - 20, 1, 0.30, 0.34, 0.40, 0.40)
+        y = y + 6
+        drawModRow(self, selfRow, y, font)
+        y = y + 15
+        self:drawRect(10, y + 1, self:getWidth() - 20, 1, 0.30, 0.34, 0.40, 0.40)
+        y = y + 4
+    end
+
+    local gx = 10
+    local gw = self:getWidth() - 20
+    local available = self:getHeight() - y - 12
+    local gh = math.max(80, math.min(180, math.floor(available)))
+    if gh > 40 then
+        y = drawBudget(self, gx, y + 6, gw, gh, font)
+    end
+end
+
+---------------------------------------------------------------------------
+-- Module interface
+---------------------------------------------------------------------------
+ModProfilerUI = ModProfilerUI or {}
+
+local _panel
+
+function ModProfilerUI.show()
+    if not _panel then
+        _panel = ModProfilerPanel:new(nil, nil, nil, nil)
+        _panel:initialise()      -- ISCollapsableWindow:initialise() calls createChildren internally
+        _panel:addToUIManager()
+    end
+    _panel:setVisible(true)
+    if _panel.intervalTicks and ModProfiler.setIntervalTicks then
+        ModProfiler.setIntervalTicks(_panel.intervalTicks)
+    end
+    local t = ModProfilerINI.load(); t.visible = "true"; ModProfilerINI.save(t)
+end
+
+function ModProfilerUI.hide()
+    if _panel then _panel:setVisible(false) end
+end
+
+function ModProfilerUI.toggle()
+    if _panel and _panel:getIsVisible() then
+        _panel:close()
+        _panel = nil
+    else
+        ModProfilerUI.show()
+    end
+end
+
+function ModProfilerUI.getPanel() return _panel end
