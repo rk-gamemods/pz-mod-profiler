@@ -212,16 +212,15 @@ local function drawModRow(panel, row, y, font)
         panel:drawRect(8, y - 1, panel:getWidth() - 16, 15, 0.35, 0.35, 0.20, 0.12)
     end
     local col = TEXT_MUTED
-    local nameStr = (row.pinned and "* " or "  ") .. (row.mod or "?")
-    panel:drawText(nameStr, COLS[1].x, y, col.r, col.g, col.b, 1, font)
+    panel:drawText(row._fmtName, COLS[1].x, y, col.r, col.g, col.b, 1, font)
     local function R(txt, c)
         local tw = getTextManager():MeasureStringX(font, txt)
         panel:drawText(txt, c.x + c.w - tw, y, col.r, col.g, col.b, 1, font)
     end
-    R(string.format("%.1f%%", row.pctTotal or 0), COLS[2])
-    R(string.format("%.2f ms", row.p50 or 0), COLS[3])
-    R(string.format("%.2f ms", row.p95 or 0), COLS[4])
-    R(row.spikesPerMin and string.format("%.1f", row.spikesPerMin) or "-", COLS[5])
+    R(row._fmtPct,   COLS[2])
+    R(row._fmtP50,   COLS[3])
+    R(row._fmtP95,   COLS[4])
+    R(row._fmtSpk,   COLS[5])
     local g1 = row.shortG or "-"; local g2 = row.longG or "-"
     local pair = g1 .. " " .. g2
     local tw = getTextManager():MeasureStringX(font, pair)
@@ -239,17 +238,11 @@ local function drawHeader(panel, y, font)
     local enabled = ModProfiler.isEnabled and ModProfiler.isEnabled()
     local statusTxt = enabled and "[ON]" or "[OFF]"
 
-    -- Use cached values from the throttled refresh cycle (no per-frame alloc).
-    local budgetMs = panel._cachedHeaderBudgetMs or (1000/60)
-    local cpuMs    = panel._cachedHeaderCpuMs or 0
-    local pct      = panel._cachedHeaderPct or 0
-
     panel:drawText("PROFILER", 10, y, 0.82, 0.82, 0.85, 1, font)
     local afterLabelX = 10 + getTextManager():MeasureStringX(font, "PROFILER ")
     panel:drawText(statusTxt, afterLabelX, y, TEXT_MUTED.r, TEXT_MUTED.g, TEXT_MUTED.b, 1, font)
 
-    local bigStr = string.format("%.1f / %.1f ms frame (%d%%)", cpuMs, budgetMs, pct+0.5)
-    if panel:getWidth() < 700 then bigStr = string.format("%.1f/%.1fms", cpuMs, budgetMs) end
+    local bigStr = panel:getWidth() < 700 and panel._fmtHeaderBigShort or panel._fmtHeaderBig
     local bigX = afterLabelX + getTextManager():MeasureStringX(font, statusTxt .. "  ")
     panel:drawText(bigStr, bigX, y, TEXT_MUTED.r, TEXT_MUTED.g, TEXT_MUTED.b, 1, font)
 
@@ -343,9 +336,9 @@ local function drawBudget(panel, x, y, w, h, font)
         end
     end
 
-    local titlePad = 22
+    local titlePad = 26
     local gy = y + titlePad
-    local footerPad = 14
+    local footerPad = 18
     local gh = h - titlePad - footerPad
 
     -- Use pre-filled layer arrays from refreshBudgetLayers (zero alloc here).
@@ -366,15 +359,13 @@ local function drawBudget(panel, x, y, w, h, font)
         panel:drawText("budget", lx + 12, legendY, TEXT_DIM.r, TEXT_DIM.g, TEXT_DIM.b, 1, font)
     end
 
-    -- Footer uses pre-computed stats from refreshBudgetLayers.
-    local footer = string.format("Avg headroom: %.1f ms (%d%% free)   min: %.1f   max: %.1f",
-                                 panel._footerAvgHr, panel._footerFreePct+0.5, panel._footerMinHr, panel._footerMaxHr)
-    panel:drawText(footer, x, y + h + 2, TEXT_DIM.r, TEXT_DIM.g, TEXT_DIM.b, 1, font)
+    -- Footer uses pre-cached string from refresh cycle.
+    panel:drawText(panel._fmtBudgetFooter, x, y + h + 4, TEXT_DIM.r, TEXT_DIM.g, TEXT_DIM.b, 1, font)
 
     local note = "Mods band = profiled Lua callbacks only; native/asset cost rolls into Engine band."
-    panel:drawText(note, x, y + h + 14, TEXT_DIM.r, TEXT_DIM.g, TEXT_DIM.b, 0.75, font)
+    panel:drawText(note, x, y + h + 18, TEXT_DIM.r, TEXT_DIM.g, TEXT_DIM.b, 0.75, font)
 
-    return y + h + 28
+    return y + h + 34
 end
 
 ---------------------------------------------------------------------------
@@ -425,6 +416,9 @@ function ModProfilerPanel:new(x, y, w, h)
     o._footerMinHr         = 0
     o._footerMaxHr         = 0
     o._footerFreePct       = 0
+    o._fmtHeaderBig        = ""    -- cached formatted strings (rebuilt per refresh)
+    o._fmtHeaderBigShort   = ""
+    o._fmtBudgetFooter     = ""
     -- Static layer descriptors — point to the pre-allocated value arrays.
     -- drawBudget picks the right list each frame with zero allocation.
     o._layerListCapped = {
@@ -586,6 +580,15 @@ function ModProfilerPanel:refreshRows()
     for _, r in ipairs(rows) do
         if r.pinned or #displayed < self.topN then displayed[#displayed+1] = r end
     end
+    -- Pre-format display strings once per refresh — eliminates ~100
+    -- string.format calls per frame from the draw path.
+    for _, r in ipairs(displayed) do
+        r._fmtName = (r.pinned and "* " or "  ") .. (r.mod or "?")
+        r._fmtPct  = string.format("%.1f%%", r.pctTotal or 0)
+        r._fmtP50  = string.format("%.2f ms", r.p50 or 0)
+        r._fmtP95  = string.format("%.2f ms", r.p95 or 0)
+        r._fmtSpk  = r.spikesPerMin and string.format("%.1f", r.spikesPerMin) or "-"
+    end
     self.rows = displayed
 end
 
@@ -655,7 +658,7 @@ function ModProfilerPanel:buildSelfCostRow()
     local p50 = percentile(scratch, 50)
     local p95 = percentile(scratch, 95)
 
-    return {
+    local row = {
         mod = "00_ModProfiler",
         pctTotal = 0, p50 = p50, p95 = p95,
         spikesPerMin = 0,
@@ -663,6 +666,12 @@ function ModProfilerPanel:buildSelfCostRow()
         longG  = ">", longC  = TREND_NEUTRAL,
         pinned = false,
     }
+    row._fmtName = "  00_ModProfiler"
+    row._fmtPct  = "0.0%"
+    row._fmtP50  = string.format("%.2f ms", p50)
+    row._fmtP95  = string.format("%.2f ms", p95)
+    row._fmtSpk  = "0.0"
+    return row
 end
 
 ---------------------------------------------------------------------------
@@ -729,6 +738,14 @@ function ModProfilerPanel:prerender()
         end
         self._cachedHeaderPct = self._cachedHeaderBudgetMs > 0
             and (self._cachedHeaderCpuMs / self._cachedHeaderBudgetMs * 100) or 0
+        -- Cache formatted strings so the per-frame draw path has zero string.format calls.
+        local cpuMs    = self._cachedHeaderCpuMs
+        local budgetMs = self._cachedHeaderBudgetMs
+        local pct      = self._cachedHeaderPct
+        self._fmtHeaderBig      = string.format("%.1f / %.1f ms frame (%d%%)", cpuMs, budgetMs, pct+0.5)
+        self._fmtHeaderBigShort = string.format("%.1f/%.1fms", cpuMs, budgetMs)
+        self._fmtBudgetFooter   = string.format("Avg headroom: %.1f ms (%d%% free)   min: %.1f   max: %.1f",
+                                    self._footerAvgHr, self._footerFreePct+0.5, self._footerMinHr, self._footerMaxHr)
     end
 
     y = drawHeader(self, y, font)
@@ -744,17 +761,22 @@ function ModProfilerPanel:prerender()
 
     local selfRow = self._cachedSelfRow
     if selfRow then
-        self:drawRect(10, y + 2, self:getWidth() - 20, 1, 0.30, 0.34, 0.40, 0.40)
-        y = y + 6
+        -- Separator above self-cost row: give extra gap so the line
+        -- doesn't visually merge with the last mod row's text.
+        y = y + 4
+        self:drawRect(10, y, self:getWidth() - 20, 1, 0.30, 0.34, 0.40, 0.40)
+        y = y + 5
         drawModRow(self, selfRow, y, font)
         y = y + 15
-        self:drawRect(10, y + 1, self:getWidth() - 20, 1, 0.30, 0.34, 0.40, 0.40)
-        y = y + 4
+        -- Separator below self-cost row: gap before the frame budget section.
+        y = y + 3
+        self:drawRect(10, y, self:getWidth() - 20, 1, 0.30, 0.34, 0.40, 0.40)
+        y = y + 6
     end
 
     local gx = 10
     local gw = self:getWidth() - 20
-    local available = self:getHeight() - y - 12
+    local available = self:getHeight() - y - 40
     local gh = math.max(80, math.min(180, math.floor(available)))
     if gh > 40 then
         y = drawBudget(self, gx, y + 6, gw, gh, font)
