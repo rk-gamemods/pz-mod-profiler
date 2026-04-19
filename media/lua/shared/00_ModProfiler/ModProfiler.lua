@@ -252,12 +252,13 @@ local function probeHeapMb()
     if type(getPerformanceLocal) ~= "function" then return nil, nil end
     local ok, t = pcall(getPerformanceLocal)
     if not ok or type(t) ~= "table" then return nil, nil end
-    -- getPerformanceLocal() returns a table; memory keys vary by PZ build.
-    -- Try common key names for free/total memory (in bytes).
-    local free  = t.freeMemory  or t.freemem  or t["freeMemory"]
-    local total = t.totalMemory or t.totalmem or t["totalMemory"]
-    if type(free) == "number" and type(total) == "number" then
-        return free / (1024*1024), total / (1024*1024)  -- convert to MB
+    -- PZ keys: "memory-free", "memory-total" (in MB, divided by 1e6 in Java).
+    -- NOTE: StatisticManager.update() only runs in multiplayer, so these
+    -- counters are empty/zero in single-player. Nothing we can do from Lua.
+    local free  = t["memory-free"]
+    local total = t["memory-total"]
+    if type(free) == "number" and free > 0 and type(total) == "number" and total > 0 then
+        return free, total  -- already in MB from Java side
     end
     return nil, nil
 end

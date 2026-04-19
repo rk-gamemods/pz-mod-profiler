@@ -694,20 +694,16 @@ function ModProfilerPanel:refreshGapStats()
     local heapUsed  = heapTotal > 0 and (heapTotal - heapFree) or 0
     local heapPct   = heapTotal > 0 and (heapUsed / heapTotal * 100) or 0
 
-    if cpuW > 0 or gpuW > 0 or heapTotal > 0 then
-        local parts = {}
-        if cpuW > 0 or gpuW > 0 then
-            parts[#parts+1] = string.format("render sync: cpu-wait %.1f / gpu-wait %.1f ms", cpuW, gpuW)
-        end
-        if heapTotal > 0 then
-            local allocDir = heapAlloc > 0 and "+" or ""
-            parts[#parts+1] = string.format("heap: %dMB / %dMB (%d%%) %s%.0fMB/int",
-                heapUsed, heapTotal, heapPct + 0.5, allocDir, heapAlloc)
-        end
-        self._fmtGapLine2 = table.concat(parts, "   ")
+    local parts = {}
+    parts[#parts+1] = string.format("render sync: cpu-wait %.1f / gpu-wait %.1f ms", cpuW, gpuW)
+    if heapTotal > 0 then
+        local allocDir = heapAlloc > 0 and "+" or ""
+        parts[#parts+1] = string.format("heap: %dMB / %dMB (%d%%) %s%.0fMB/int",
+            heapUsed, heapTotal, heapPct + 0.5, allocDir, heapAlloc)
     else
-        self._fmtGapLine2 = ""
+        parts[#parts+1] = "heap: n/a (SP)"
     end
+    self._fmtGapLine2 = table.concat(parts, "   ")
 end
 
 function ModProfilerPanel:buildSelfCostRow()
