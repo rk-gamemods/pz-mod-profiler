@@ -7,6 +7,7 @@ Usage:
 """
 
 import hashlib
+import importlib.util
 import re
 import shutil
 import sys
@@ -36,6 +37,21 @@ def deploy() -> None:
         sys.exit(f"ERROR: source media not found: {src_media}")
     if not mod_info.is_file():
         sys.exit(f"ERROR: mod.info not found: {mod_info}")
+
+    # Build Java companion if source exists and javac is available
+    java_src = mod_root / "java" / "src"
+    if java_src.is_dir() and shutil.which("javac"):
+        print(f"  building Java companion...")
+        spec = importlib.util.spec_from_file_location(
+            "build_java", mod_root / "build_java.py"
+        )
+        build_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(build_mod)
+        build_mod.build()
+    elif java_src.is_dir():
+        jar_path = mod_root / "media" / "java" / "00_ModProfiler.jar"
+        if not jar_path.is_file():
+            print("  WARNING: Java source exists but javac not found, and no pre-built JAR")
 
     mod_info_text = mod_info.read_text(encoding="utf-8")
     m = re.search(r"versionMin\s*=\s*(\S+)", mod_info_text)

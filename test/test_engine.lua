@@ -22,6 +22,7 @@ local function section(name) print("\n[" .. name .. "]") end
 
 -- Force a fresh load of the engine on each scenario.
 local function loadEngine()
+    env.clearEvents()
     package.loaded["ModProfiler"] = nil
     _G.ModProfiler = nil
     local src = assert(io.open("media/lua/shared/00_ModProfiler/ModProfiler.lua", "r")):read("*a")
@@ -233,6 +234,66 @@ ok("ringGet(ring, count+1) == nil", MP.ringGet(budgetRing, budgetRing.count + 1)
 -- Raw mod ring access.
 local modLiveRing = MP.getModLiveRing("TestMod")
 ok("getModLiveRing returns ring", modLiveRing ~= nil and modLiveRing.count and modLiveRing.count > 0)
+
+---------------------------------------------------------------------------
+section("Scenario I: ZBPerfBridge heap data flows to budget ring")
+---------------------------------------------------------------------------
+env.setMs(0)
+env.setPerformance(env.defaultPerfFull())
+env.setCPU(5.0)
+local zbCtrl = env.installZBPerfBridge({
+    heapFreeMb = 1024.0, heapTotalMb = 2048.0, heapMaxMb = 4096.0,
+    gcCount = 10, gcTimeMs = 50,
+})
+MP = loadEngine()
+env.setMs(100)
+for i = 1, 120 do env.trigger("OnTick") end
+local samplesI = MP.getFrameBudgetSamples()
+ok("budget sample with ZBPerfBridge", #samplesI >= 1)
+if #samplesI >= 1 then
+    local s = samplesI[#samplesI]
+    ok("heapFreeMb from bridge", s.heapFreeMb == 1024.0,
+       "got " .. tostring(s.heapFreeMb))
+    ok("heapTotalMb from bridge", s.heapTotalMb == 2048.0,
+       "got " .. tostring(s.heapTotalMb))
+    ok("gcCount from bridge (first interval)", s.gcCount == 10,
+       "got " .. tostring(s.gcCount))
+    ok("gcTimeMs from bridge (first interval)", s.gcTimeMs == 50,
+       "got " .. tostring(s.gcTimeMs))
+end
+
+-- Second interval with GC activity: add 5 collections, 30ms pause
+zbCtrl.addGc(5, 30)
+env.setMs(300)
+for i = 1, 120 do env.trigger("OnTick") end
+samplesI = MP.getFrameBudgetSamples()
+if #samplesI >= 2 then
+    local s = samplesI[#samplesI]
+    ok("gcCount delta for second interval", s.gcCount == 5,
+       "got " .. tostring(s.gcCount))
+    ok("gcTimeMs delta for second interval", s.gcTimeMs == 30,
+       "got " .. tostring(s.gcTimeMs))
+end
+env.removeZBPerfBridge()
+
+---------------------------------------------------------------------------
+section("Scenario J: no ZBPerfBridge — graceful fallback, GC fields zero")
+---------------------------------------------------------------------------
+env.setMs(0)
+env.setPerformance(env.defaultPerfFull())
+env.setCPU(5.0)
+env.removeZBPerfBridge()
+MP = loadEngine()
+env.setMs(100)
+for i = 1, 120 do env.trigger("OnTick") end
+local samplesJ = MP.getFrameBudgetSamples()
+ok("budget sample without bridge", #samplesJ >= 1)
+if #samplesJ >= 1 then
+    local s = samplesJ[#samplesJ]
+    ok("gcCount is 0 without bridge", s.gcCount == 0)
+    ok("gcTimeMs is 0 without bridge", s.gcTimeMs == 0)
+    ok("heapFreeMb is 0 without bridge (no MP either)", s.heapFreeMb == 0)
+end
 
 ---------------------------------------------------------------------------
 print(string.format("\n== %d passed, %d failed ==", passed, failed))

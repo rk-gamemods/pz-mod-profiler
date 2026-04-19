@@ -685,7 +685,7 @@ function ModProfilerPanel:refreshGapStats()
         "Unattributed: %.1f ms (avg %.1f ms, %d%% of CPU)   mods: %.1f ms   total: %.1f ms",
         lastGap, avgGap, gapPct + 0.5, lastMod, lastCpu)
 
-    -- Second line: render-sync + heap breakdown (if available)
+    -- Second line: render-sync + heap + GC breakdown
     local cpuW = last.cpuWaitMs or 0
     local gpuW = last.gpuWaitMs or 0
     local heapFree  = last.heapFreeMb or 0
@@ -693,6 +693,8 @@ function ModProfilerPanel:refreshGapStats()
     local heapAlloc = last.heapAllocMb or 0
     local heapUsed  = heapTotal > 0 and (heapTotal - heapFree) or 0
     local heapPct   = heapTotal > 0 and (heapUsed / heapTotal * 100) or 0
+    local gcCount   = last.gcCount or 0
+    local gcTimeMs  = last.gcTimeMs or 0
 
     local parts = {}
     parts[#parts+1] = string.format("render sync: cpu-wait %.1f / gpu-wait %.1f ms", cpuW, gpuW)
@@ -701,7 +703,12 @@ function ModProfilerPanel:refreshGapStats()
         parts[#parts+1] = string.format("heap: %dMB / %dMB (%d%%) %s%.0fMB/int",
             heapUsed, heapTotal, heapPct + 0.5, allocDir, heapAlloc)
     else
-        parts[#parts+1] = "heap: n/a (SP)"
+        parts[#parts+1] = "heap: n/a (no ZBPerfBridge)"
+    end
+    if gcCount > 0 or gcTimeMs > 0 then
+        parts[#parts+1] = string.format("GC: %d collections, %dms pause", gcCount, gcTimeMs)
+    elseif heapTotal > 0 then
+        parts[#parts+1] = "GC: idle"
     end
     self._fmtGapLine2 = table.concat(parts, "   ")
 end

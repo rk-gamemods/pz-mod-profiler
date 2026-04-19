@@ -30,6 +30,10 @@ function M.trigger(name, ...)
     local slot = _events[name]; if not slot then return end
     for _, h in ipairs(slot.handlers) do h(...) end
 end
+function M.clearEvents()
+    _events = {}
+    _G.Events = setmetatable({}, { __index = function(_, k) return eventSlot(k) end })
+end
 
 -- Closure introspection: fake source attribution so extractModName runs.
 _G.getFilenameOfClosure = function(_) return "media/lua/shared/TestMod/Main.lua" end
@@ -77,5 +81,49 @@ function M.perfMissingUncapped()
     return { getFramerate = function(self) return 60 end }
 end
 function M.perfCompletelyMissing() return nil end
+
+-- ZBPerfBridge mock: simulates the Java-side performance bridge
+function M.installZBPerfBridge(opts)
+    opts = opts or {}
+    local heapFree  = opts.heapFreeMb  or 512.0
+    local heapTotal = opts.heapTotalMb or 2048.0
+    local heapMax   = opts.heapMaxMb   or 4096.0
+    local gcCount   = opts.gcCount     or 0
+    local gcTimeMs  = opts.gcTimeMs    or 0
+    local prevCount, prevTime = 0, 0
+    local deltaCount, deltaTime = 0, 0
+    _G.ZBPerfBridge = {
+        getHeapFreeMb  = function() return heapFree end,
+        getHeapTotalMb = function() return heapTotal end,
+        getHeapMaxMb   = function() return heapMax end,
+        getHeapUsedMb  = function() return heapTotal - heapFree end,
+        getGcTotalCount = function() return gcCount end,
+        getGcTotalTimeMs = function() return gcTimeMs end,
+        snapshotGc = function()
+            deltaCount = gcCount - prevCount
+            deltaTime = gcTimeMs - prevTime
+            prevCount = gcCount
+            prevTime = gcTimeMs
+        end,
+        getGcDeltaCount = function() return deltaCount end,
+        getGcDeltaTimeMs = function() return deltaTime end,
+        isAvailable = function() return true end,
+    }
+    -- Allow test to advance GC counters between intervals
+    return {
+        addGc = function(count, timeMs)
+            gcCount = gcCount + count
+            gcTimeMs = gcTimeMs + timeMs
+        end,
+        setHeap = function(free, total)
+            heapFree = free
+            heapTotal = total
+        end,
+    }
+end
+
+function M.removeZBPerfBridge()
+    _G.ZBPerfBridge = nil
+end
 
 return M

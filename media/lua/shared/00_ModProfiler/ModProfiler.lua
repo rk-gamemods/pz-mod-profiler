@@ -249,17 +249,38 @@ local function probeGpuWaitMs()
 end
 
 local function probeHeapMb()
+    -- Prefer ZBPerfBridge (works in single-player via JMX)
+    if type(ZBPerfBridge) == "table" and type(ZBPerfBridge.getHeapFreeMb) == "function" then
+        local okF, free  = pcall(ZBPerfBridge.getHeapFreeMb)
+        local okT, total = pcall(ZBPerfBridge.getHeapTotalMb)
+        if okF and okT and type(free) == "number" and type(total) == "number"
+           and free > 0 and total > 0 then
+            return free, total
+        end
+    end
+    -- Fallback: PZ getPerformanceLocal (multiplayer only)
     if type(getPerformanceLocal) ~= "function" then return nil, nil end
     local ok, t = pcall(getPerformanceLocal)
     if not ok or type(t) ~= "table" then return nil, nil end
-    -- PZ keys: "memory-free", "memory-total" (in MB, divided by 1e6 in Java).
-    -- NOTE: StatisticManager.update() only runs in multiplayer, so these
-    -- counters are empty/zero in single-player. Nothing we can do from Lua.
     local free  = t["memory-free"]
     local total = t["memory-total"]
     if type(free) == "number" and free > 0 and type(total) == "number" and total > 0 then
-        return free, total  -- already in MB from Java side
+        return free, total
     end
+    return nil, nil
+end
+
+--- Snapshot GC counters. Call once per interval.
+-- Returns (deltaCount, deltaTimeMs) or (nil, nil) if bridge unavailable.
+local function probeGcDelta()
+    if type(ZBPerfBridge) ~= "table" or type(ZBPerfBridge.snapshotGc) ~= "function" then
+        return nil, nil
+    end
+    local ok = pcall(ZBPerfBridge.snapshotGc)
+    if not ok then return nil, nil end
+    local okC, count = pcall(ZBPerfBridge.getGcDeltaCount)
+    local okT, timeMs = pcall(ZBPerfBridge.getGcDeltaTimeMs)
+    if okC and okT then return count, timeMs end
     return nil, nil
 end
 
@@ -488,6 +509,10 @@ local function dumpIntervalReport(shouldPrint)
     end
     _heapFreeAtIntervalStart  = heapFreeMb or 0
     _heapTotalAtIntervalStart = heapTotalMb or 0
+
+    -- GC snapshot: delta collections and pause time since last interval.
+    local gcDeltaCount, gcDeltaTimeMs = probeGcDelta()
+
     local modMs      = grandMs / INTERVAL_TICKS
     local engineMs   = math.max(0, cpuMs - modMs)
     local headroomMs = math.max(0, budgetMs - cpuMs)
@@ -498,6 +523,7 @@ local function dumpIntervalReport(shouldPrint)
         cpuWaitMs = cpuWaitMs, gpuWaitMs = gpuWaitMs,
         heapFreeMb = heapFreeMb or 0, heapTotalMb = heapTotalMb or 0,
         heapAllocMb = heapAllocMb,
+        gcCount = gcDeltaCount or 0, gcTimeMs = gcDeltaTimeMs or 0,
     })
     _snapshotDirty = true
 
