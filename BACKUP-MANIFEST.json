@@ -1,0 +1,43 @@
+{
+  "format": "project-recovery-parts-v1",
+  "sourcePlan": {
+    "slug": "pz-00_modprofiler",
+    "repo": "rk-gamemods/pz-mod-profiler",
+    "allowCreate": false,
+    "sources": [
+      {
+        "root": "C:\\Users\\Admin\\Documents\\GIT\\GameMods\\PZMods\\00_ModProfiler"
+      }
+    ]
+  },
+  "parts": [
+    {
+      "name": "recovery.tar.gz.part0001",
+      "bytes": 317835,
+      "sha256": "c6b9b890b1dd2aba1af5a962dcaeff493423bb0ac41a4542e71e37b6a3af27f6"
+    }
+  ],
+  "archiveSha256": "c6b9b890b1dd2aba1af5a962dcaeff493423bb0ac41a4542e71e37b6a3af27f6",
+  "archiveBytes": 317835,
+  "selectedFiles": 57,
+  "selectedLogicalBytes": 827602,
+  "gitRepositories": 1,
+  "excluded": [
+    {
+      "source": 0,
+      "path": "__pycache__",
+      "reason": "rebuildable/test-generated"
+    },
+    {
+      "source": 0,
+      "path": "tools/__pycache__",
+      "reason": "rebuildable/test-generated"
+    },
+    {
+      "source": 0,
+      "path": ".git",
+      "reason": "rebuildable/test-generated"
+    }
+  ],
+  "retained": []
+}
